@@ -1,0 +1,28 @@
+# Build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS / misc
+.DS_Store
+
+# Logs / runtime
+*.log
+*.pid
+*.sock
+
+# Secrets / local config
+.env
+*.key
+*.pem
+*.crt
+secrets/
+config.local.*
