@@ -6,7 +6,7 @@ This project is an exploratory, end-to-end implementation of a **real-time, even
 
 **_Building Real Time Event Driven KDB-X Systems_ (Data Intellect)**
 
-The goal is not to reproduce a full production system, but to **design, reason about, and incrementally build** a minimal yet realistic architecture that reflects best practices used in low-latency financial systems.
+The objective is not to reproduce a full production system, but to **design, reason about, and incrementally build** a minimal yet realistic architecture reflecting best practices used in low-latency financial systems.
 
 The project intentionally separates:
 
@@ -25,15 +25,16 @@ The system aims to:
 
 - Ingest **real-time trade data** from Binance WebSocket streams (BTCUSDT, ETHUSDT)
 - Process events in an **event-driven** manner
+- Publish events into a **kdb+ tickerplant via IPC**
+- Define and enforce a **canonical trade schema**
 - Compute **rolling analytics** (e.g. average price over the last *N* minutes)
-- Capture and reason about **latency** using disciplined, explicit measurement
-- Serve as a learning and reference implementation for real-time KDB-X-style architectures
+- Capture and reason about **latency** using disciplined, architecture-aware measurement
 
 ---
 
 ## Documentation-First Approach
 
-This project deliberately starts with **documentation and decisions before code**.
+This project intentionally starts with **documentation and decisions before code**.
 
 Documentation is treated as part of the system, not as an afterthought.
 
@@ -64,13 +65,14 @@ Defines how latency is expressed, measured, and interpreted in this project, inc
 - Clock synchronisation assumptions
 - Correlation and skew handling
 
-This document ensures that performance discussions are precise and reproducible.
+This ensures that performance discussions are precise, reproducible, and meaningful.
 
 ---
 
 ## Architecture Decision Records (ADRs)
 
 All non-trivial design choices are captured as **Architecture Decision Records** under:
+docs/decisions/
 
 
 ADRs:
@@ -79,10 +81,10 @@ ADRs:
 - Prevent accidental architecture drift
 - Allow decisions to evolve consciously
 
-Key ADRs include:
+Key ADRs cover:
 - Timestamping and latency measurement
-- Feed handler → tickerplant ingestion strategy
-- Schema normalisation
+- Feed handler → tickerplant ingestion via IPC
+- Canonical trade schema
 - Telemetry vs market data separation
 - Recovery scope
 - Visualisation strategy
@@ -94,6 +96,7 @@ Key ADRs include:
 **`docs/specs/trades-schema.md`**
 
 Defines the canonical schema for Binance trade events as stored in kdb+/KDB-X, including:
+
 - Naming conventions
 - Keys and uniqueness
 - Timestamp semantics
@@ -114,17 +117,19 @@ Defines the canonical schema for Binance trade events as stored in kdb+/KDB-X, i
   - Exchange timestamps
   - Feed-handler wall-clock timestamps
   - Feed-handler monotonic timing
-- Emission of parsed trade events to stdout for verification
+- **IPC publication into a running kdb+ tickerplant**
+- **Persistence of live trade data into `trade_binance`**
+- Verified end-to-end ingestion:
+  - Binance → Feed Handler → Tickerplant
 
 ### Not Yet Implemented
 
-- IPC publication into kdb+/KDB-X tickerplant
-- RDB storage and windowed analytics
+- RDB processes and windowed analytics
 - Telemetry aggregation tables
 - Recovery and replay mechanisms
 - Dashboards (KX Dashboards)
 
-These are intentionally deferred until architectural decisions are validated.
+These are intentionally deferred until ingestion, schema, and measurement are fully validated.
 
 ---
 
@@ -146,20 +151,20 @@ These are intentionally deferred until architectural decisions are validated.
 ├── src/
 │   ├── main.cpp
 │   └── feed_handler.cpp
+├── kdb/
+│   └── tp.q
 ├── docs/
-│   ├── README.md
 │   ├── api-binance.md
 │   ├── kdbx-real-time-architecture-reference.md
 │   ├── kdbx-real-time-architecture-measurement-notes.md
 │   ├── specs/
 │   │   └── trades-schema.md
-│   ├── decisions/
-│   │   ├── adr-001-timestamps-and-latency-measurement.md
-│   │   ├── adr-002-feed-handler-to-tickerplant.md
-│   │   ├── adr-003-ingestion-without-logfile.md
-│   │   ├── adr-004-schema-normalisation.md
-│   │   ├── adr-005-telemetry-vs-market-data.md
-│   │   ├── adr-006-recovery-scope.md
-│   │   └── adr-007-visualisation-strategy.md
-│   └── reference/
-│       └── DataIntellect_Real_Time_KDBX.pdf
+│   └── decisions/
+│       ├── adr-001-timestamps-and-latency-measurement.md
+│       ├── adr-002-feed-handler-to-tickerplant.md
+│       ├── adr-003-ingestion-without-logfile.md
+│       ├── adr-004-schema-normalisation.md
+│       ├── adr-005-telemetry-vs-market-data.md
+│       ├── adr-006-recovery-scope.md
+│       └── adr-007-visualisation-strategy.md
+
