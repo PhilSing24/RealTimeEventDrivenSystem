@@ -1,4 +1,4 @@
-/ initialise table
+/ table schemas
 trade_binance:([]
   time:`timestamp$();
   sym:`symbol$();
@@ -9,11 +9,9 @@ trade_binance:([]
   exchEventTimeMs:`long$();
   exchTradeTimeMs:`long$();
   fhRecvTimeUtcNs:`long$()
- );
+  );
 
 / canonical tickerplant update function
-.u.upd:{[tbl; data]
-  if[tbl=`trade_binance;
-    trade_binance ,: enlist data
-  ];
-}
+.u.upd:{[tbl;data]
+  tbl insert data;
+  };
