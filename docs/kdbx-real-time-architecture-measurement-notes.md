@@ -1,4 +1,4 @@
-# Latency SLOs and Measurement Notes (Companion)
+# Latency Service-Level Objectives (SLOs) and Measurement Notes (Companion)
 
 This document is a companion to `kdbx-real-time-architecture-reference.md`.  
 It captures practical guidance on how latency SLOs and latency measurement are defined and implemented for this project.
@@ -7,7 +7,7 @@ It captures practical guidance on how latency SLOs and latency measurement are d
 
 Latency should be tracked using percentiles over a defined rolling window:
 
-- p50: typical latency
+- p50: typical latency (equivalent to the median)
 - p95: majority-case tail
 - p99: operationally significant tail
 - p99.9 (optional): extreme tail (only if required)

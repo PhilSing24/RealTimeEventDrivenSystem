@@ -26,18 +26,19 @@ Relevant fields:
 ### Key / Uniqueness
 Primary uniqueness key: (`sym`, `tradeId`)
 
-### Columns (proposed)
+### Columns
 | Column | Type | Description |
 |---|---|---|
 | time | timestamp | Tickerplant receive time (`.z.p`) when the update is accepted/logged and published. |
-| sym | symbol | Normalised symbol (e.g., `BTCUSDT`) |
-| tradeId | long | Binance trade id (`t`) |
-| price | float | Trade price |
-| qty | float | Trade quantity |
-| buyerIsMaker | boolean | Binance `m` |
-| exchEventTimeMs | long | Binance `E` (ms since epoch) |
-| exchTradeTimeMs | long | Binance `T` (ms since epoch) |
-| fhRecvTimeUtcNs | long | Feed handler wall-clock receive time (ns since epoch) |
+| sym | symbol | Normalised symbol (e.g., `BTCUSDT`). Conventional lowercase naming retained for kdb idioms. |
+| tradeId | long | Binance trade id (`t`). Unique per symbol. |
+| price | real | Trade price (64-bit floating point). |
+| qty | real | Trade quantity (64-bit floating point). |
+| buyerIsMaker | boolean | Binance `m` (`1b` if buyer is market maker). |
+| exchEventTimeMs | long | Binance `E` (event time, ms since epoch). |
+| exchTradeTimeMs | long | Binance `T` (trade time, ms since epoch). |
+| fhRecvTimeUtcNs | long | Feed handler wall-clock receive time (ns since Unix epoch, UTC). |
+
 
 ## Timestamp Semantics
 - exchEventTimeMs/exchTradeTimeMs: upstream times; used for market-to-fh estimates and correlation.
@@ -45,7 +46,15 @@ Primary uniqueness key: (`sym`, `tradeId`)
 - time: Tickerplant receive time (.z.p) used as platform-ingest time for windowing and intraday analytics.
 
 ## Notes
-- Feed-handler monotonic durations (fhParseUs, fhSendUs) are not stored per-event in this table; they are emitted to telemetry aggregates.
-## Notes
-- Numeric types: `price` and `qty` are stored as q `float` (64-bit). Binance provides these fields as JSON strings; they are parsed to numeric in the feed handler and stored numerically in kdb.
+
+- Numeric types:
+  - `price` and `qty` are stored as q `real` (64-bit floating point).
+  - Binance provides these fields as JSON strings; they are parsed and normalised to numeric values in the feed handler before publication.
+
+- Timing data:
+  - Feed-handler monotonic durations (e.g. parse and send timings) are not stored per-event in this table.
+  - Performance measurements are emitted to dedicated telemetry aggregates to avoid polluting core market data tables.
+
+- Keying:
+  - The uniqueness key (`sym`, `tradeId`) supports deduplication during reconnect and replay scenarios.
 
