@@ -1,93 +1,165 @@
-# Real-Time Event-Driven System (Binance → KDB-X)
+# Real-Time Event-Driven Market Data System (KDB-X Inspired)
 
-This repository explores the design and implementation of a real-time, event-driven market-data ingestion system, using Binance WebSocket trade streams as an upstream source and kdb+/KDB-X as the target analytics platform.
+## Overview
 
-The focus is on architecture, timing correctness, observability, and replayability, rather than a minimal feed handler.
+This project is an exploratory, end-to-end implementation of a **real-time, event-driven market data pipeline**, inspired by the paper:
 
-# Project structure
+**_Building Real Time Event Driven KDB-X Systems_ (Data Intellect)**
 
-binance_feed_handler/
+The goal is not to reproduce a full production system, but to **design, reason about, and incrementally build** a minimal yet realistic architecture that reflects best practices used in low-latency financial systems.
+
+The project intentionally separates:
+
+- Architecture reasoning
+- Measurement discipline
+- Explicit design decisions
+- Implementation
+
+This ensures that each step is understandable, reviewable, and resilient to accidental architectural drift.
+
+---
+
+## Objectives
+
+The system aims to:
+
+- Ingest **real-time trade data** from Binance WebSocket streams (BTCUSDT, ETHUSDT)
+- Process events in an **event-driven** manner
+- Compute **rolling analytics** (e.g. average price over the last *N* minutes)
+- Capture and reason about **latency** using disciplined, explicit measurement
+- Serve as a learning and reference implementation for real-time KDB-X-style architectures
+
+---
+
+## Documentation-First Approach
+
+This project deliberately starts with **documentation and decisions before code**.
+
+Documentation is treated as part of the system, not as an afterthought.
+
+---
+
+## Architecture Reference
+
+**`docs/kdbx-real-time-architecture-reference.md`**
+
+A structured, LLM-friendly extraction of architectural patterns, design trade-offs, and component responsibilities from the original Data Intellect paper.
+
+This document:
+- Does **not** prescribe an implementation
+- Serves as a navigable reference for architecture discussions
+- Provides the conceptual foundation for all subsequent decisions
+
+---
+
+## Measurement Discipline
+
+**`docs/kdbx-real-time-architecture-measurement-notes.md`**
+
+Defines how latency is expressed, measured, and interpreted in this project, including:
+
+- Latency SLO expression (p50 / p95 / p99)
+- Measurement points across components
+- Monotonic vs wall-clock time usage
+- Clock synchronisation assumptions
+- Correlation and skew handling
+
+This document ensures that performance discussions are precise and reproducible.
+
+---
+
+## Architecture Decision Records (ADRs)
+
+All non-trivial design choices are captured as **Architecture Decision Records** under:
+
+
+ADRs:
+- Make assumptions explicit
+- Document trade-offs and consequences
+- Prevent accidental architecture drift
+- Allow decisions to evolve consciously
+
+Key ADRs include:
+- Timestamping and latency measurement
+- Feed handler → tickerplant ingestion strategy
+- Schema normalisation
+- Telemetry vs market data separation
+- Recovery scope
+- Visualisation strategy
+
+---
+
+## Canonical Schema
+
+**`docs/specs/trades-schema.md`**
+
+Defines the canonical schema for Binance trade events as stored in kdb+/KDB-X, including:
+- Naming conventions
+- Keys and uniqueness
+- Timestamp semantics
+- Separation of business data and telemetry
+
+---
+
+## Current Implementation Status
+
+### Completed
+
+- C++ project setup using **CMake** (WSL / Ubuntu 22.04)
+- WebSocket ingestion using **Boost.Beast / Boost.Asio**
+- TLS support via **OpenSSL**
+- JSON parsing via **RapidJSON**
+- Real-time ingestion of Binance trade streams
+- Capture of:
+  - Exchange timestamps
+  - Feed-handler wall-clock timestamps
+  - Feed-handler monotonic timing
+- Emission of parsed trade events to stdout for verification
+
+### Not Yet Implemented
+
+- IPC publication into kdb+/KDB-X tickerplant
+- RDB storage and windowed analytics
+- Telemetry aggregation tables
+- Recovery and replay mechanisms
+- Dashboards (KX Dashboards)
+
+These are intentionally deferred until architectural decisions are validated.
+
+---
+
+## Design Philosophy
+
+- Event-driven, not batch
+- Measure before optimising
+- Separate correctness from performance
+- Prefer explicit decisions over implicit assumptions
+- Documentation is part of the system
+
+---
+
+## Project Structure
+
+```text
+.
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   └── feed_handler.cpp
 ├── docs/
+│   ├── README.md
 │   ├── api-binance.md
 │   ├── kdbx-real-time-architecture-reference.md
 │   ├── kdbx-real-time-architecture-measurement-notes.md
-│   ├── decisions/
-│   │   └── adr-001-timestamps-and-latency-measurement.md
 │   ├── specs/
 │   │   └── trades-schema.md
+│   ├── decisions/
+│   │   ├── adr-001-timestamps-and-latency-measurement.md
+│   │   ├── adr-002-feed-handler-to-tickerplant.md
+│   │   ├── adr-003-ingestion-without-logfile.md
+│   │   ├── adr-004-schema-normalisation.md
+│   │   ├── adr-005-telemetry-vs-market-data.md
+│   │   ├── adr-006-recovery-scope.md
+│   │   └── adr-007-visualisation-strategy.md
 │   └── reference/
 │       └── DataIntellect_Real_Time_KDBX.pdf
-├── src/
-│   ├── main.cpp
-│   ├── feed_handler.cpp
-│   ├── e.o
-│   └── k.h
-├── CMakeLists.txt
-└── README.md
-
-# What is implemented so far
-
-## Architecture & design
-
-Real-time KDB-X architecture patterns (feed handler, tickerplant, RDB, RTE)
-
-Recovery, resilience, performance, IPC, monitoring considerations
-
-Non-authoritative reference document for design trade-offs
-
-→ docs/kdbx-real-time-architecture-reference.md
-
-## Timing & latency measurement
-
-Clear separation of:
-
-Exchange timestamps
-
-Wall-clock receive time
-
-Monotonic receive time
-
-Explanation of NTP/PTP effects and clock skew
-
-Guidance for latency measurement and SLOs
-
-→ docs/kdbx-real-time-architecture-measurement-notes.md
-→ docs/decisions/adr-001-timestamps-and-latency-measurement.md
-
-## Binance API contract
-
-WebSocket stream behaviour (raw vs combined streams)
-
-Envelope format, connection lifecycle, limits, ping/pong
-
-Timestamp units and configuration
-
-→ docs/api-binance.md
-
-## Trade schema (draft)
-
-Canonical internal representation of Binance trade events
-
-Explicit naming, typing, and timestamp semantics
-
-Designed for replay, deduplication, and downstream analytics
-
-→ docs/specs/trades-schema.md
-
-## Feed handler prototype
-
-C++ feed handler using Boost.Asio / Boost.Beast
-
-Live connection to Binance trade streams
-
-JSON parsing via RapidJSON
-
-Captures:
-
-Exchange trade time
-
-Feed-handler wall-clock receive time
-
-Feed-handler monotonic receive time
-
-The handler currently prints normalized trade events and timestamps to stdout.
