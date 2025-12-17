@@ -1,28 +1,61 @@
-# Build outputs
+# -----------------------------
+# Build outputs (CMake / Make)
+# -----------------------------
 build/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+install_manifest.txt
 compile_commands.json
+*.ninja
+.ninja_*
 
-# IDE
+# -----------------------------
+# Binaries / objects
+# -----------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# -----------------------------
+# IDE / editor
+# -----------------------------
 .vscode/
 .idea/
+*.swp
+*.swo
 
+# -----------------------------
 # OS / misc
+# -----------------------------
 .DS_Store
+Thumbs.db
 
-# Logs / runtime
+# -----------------------------
+# Logs / runtime artefacts
+# -----------------------------
 *.log
 *.pid
 *.sock
+*.core
+core.*
 
+# -----------------------------
 # Secrets / local config
+# -----------------------------
 .env
+.env.*
 *.key
 *.pem
 *.crt
 secrets/
 config.local.*
+config.private.*
