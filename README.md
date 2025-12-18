@@ -1,170 +1,162 @@
-# Real-Time Event-Driven Market Data System (KDB-X Inspired)
+# Real-Time Event-Driven Market Data System
 
-## Overview
+A real-time, event-driven market data pipeline built with **C++** and **kdb+/KDB-X**, inspired by production architectures used in tier-1 financial institutions.
 
-This project is an exploratory, end-to-end implementation of a **real-time, event-driven market data pipeline**, inspired by the paper:
+## What This Project Does
 
-**_Building Real Time Event Driven KDB-X Systems_ (Data Intellect)**
+```
+Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──► RDB
+                                                │
+                                                └──► (RTE - future)
+```
 
-The objective is not to reproduce a full production system, but to **design, reason about, and incrementally build** a minimal yet realistic architecture reflecting best practices used in low-latency financial systems.
+- Ingests **real-time trade data** from Binance (BTCUSDT)
+- Captures **latency measurements** at every pipeline stage
+- Publishes via **IPC** to a kdb+ tickerplant with pub/sub
+- Stores trades with **full instrumentation** (14 timestamp/latency fields)
+- Aggregates **telemetry metrics** (p50/p95/p99 latencies, throughput) every second
 
-The project intentionally separates:
+## Quick Start
 
-- Architecture reasoning
-- Measurement discipline
-- Explicit design decisions
-- Implementation
+```bash
+# Terminal 1: Start Tickerplant
+q kdb/tp.q
 
-This ensures that each step is understandable, reviewable, and resilient to accidental architectural drift.
+# Terminal 2: Start RDB
+q kdb/rdb.q
 
----
+# Terminal 3: Build and run Feed Handler
+cmake -S . -B build
+cmake --build build
+./build/binance_feed_handler
+```
 
-## Objectives
+## Verify It Works
 
-The system aims to:
+In the RDB terminal (Terminal 2):
 
-- Ingest **real-time trade data** from Binance WebSocket streams (BTCUSDT, ETHUSDT)
-- Process events in an **event-driven** manner
-- Publish events into a **kdb+ tickerplant via IPC**
-- Define and enforce a **canonical trade schema**
-- Compute **rolling analytics** (e.g. average price over the last *N* minutes)
-- Capture and reason about **latency** using disciplined, architecture-aware measurement
+```q
+/ Check data is flowing
+count trade_binance
 
----
+/ View recent trades with latencies
+select sym, tradeId, fhParseUs, fhSendUs, 
+    fhToTpMs:(tpRecvTimeUtcNs - fhRecvTimeUtcNs) % 1e6,
+    tpToRdbMs:(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) % 1e6
+    from -5#trade_binance
 
-## Documentation-First Approach
+/ View telemetry (after a few seconds)
+select from telemetry_latency_e2e
+```
 
-This project intentionally starts with **documentation and decisions before code**.
+## Architecture
 
-Documentation is treated as part of the system, not as an afterthought.
+| Component | Port | Description |
+|-----------|------|-------------|
+| Feed Handler | — | C++ process: WebSocket → JSON parse → IPC publish |
+| Tickerplant | 5010 | Receives trades, timestamps, publishes to subscribers |
+| RDB | 5011 | Stores trades, computes telemetry aggregations |
 
----
+### Latency Measurement Points
 
-## Architecture Reference
+| Field | Source | Description |
+|-------|--------|-------------|
+| `fhRecvTimeUtcNs` | FH | Wall-clock when WebSocket message received |
+| `fhParseUs` | FH | Parse/normalise duration (monotonic) |
+| `fhSendUs` | FH | IPC send prep duration (monotonic) |
+| `tpRecvTimeUtcNs` | TP | Wall-clock when TP receives message |
+| `rdbApplyTimeUtcNs` | RDB | Wall-clock when trade is query-consistent |
 
-**`docs/kdbx-real-time-architecture-reference.md`**
+### Telemetry Tables
 
-A structured, LLM-friendly extraction of architectural patterns, design trade-offs, and component responsibilities from the original Data Intellect paper.
-
-This document:
-- Does **not** prescribe an implementation
-- Serves as a navigable reference for architecture discussions
-- Provides the conceptual foundation for all subsequent decisions
-
----
-
-## Measurement Discipline
-
-**`docs/kdbx-real-time-architecture-measurement-notes.md`**
-
-Defines how latency is expressed, measured, and interpreted in this project, including:
-
-- Latency SLO expression (p50 / p95 / p99)
-- Measurement points across components
-- Monotonic vs wall-clock time usage
-- Clock synchronisation assumptions
-- Correlation and skew handling
-
-This ensures that performance discussions are precise, reproducible, and meaningful.
-
----
-
-## Architecture Decision Records (ADRs)
-
-All non-trivial design choices are captured as **Architecture Decision Records** under:
-docs/decisions/
-
-
-ADRs:
-- Make assumptions explicit
-- Document trade-offs and consequences
-- Prevent accidental architecture drift
-- Allow decisions to evolve consciously
-
-Key ADRs cover:
-- Timestamping and latency measurement
-- Feed handler → tickerplant ingestion via IPC
-- Canonical trade schema
-- Telemetry vs market data separation
-- Recovery scope
-- Visualisation strategy
-
----
-
-## Canonical Schema
-
-**`docs/specs/trades-schema.md`**
-
-Defines the canonical schema for Binance trade events as stored in kdb+/KDB-X, including:
-
-- Naming conventions
-- Keys and uniqueness
-- Timestamp semantics
-- Separation of business data and telemetry
-
----
-
-## Current Implementation Status
-
-### Completed
-
-- C++ project setup using **CMake** (WSL / Ubuntu 22.04)
-- WebSocket ingestion using **Boost.Beast / Boost.Asio**
-- TLS support via **OpenSSL**
-- JSON parsing via **RapidJSON**
-- Real-time ingestion of Binance trade streams
-- Capture of:
-  - Exchange timestamps
-  - Feed-handler wall-clock timestamps
-  - Feed-handler monotonic timing
-- **IPC publication into a running kdb+ tickerplant**
-- **Persistence of live trade data into `trade_binance`**
-- Verified end-to-end ingestion:
-  - Binance → Feed Handler → Tickerplant
-
-### Not Yet Implemented
-
-- RDB processes and windowed analytics
-- Telemetry aggregation tables
-- Recovery and replay mechanisms
-- Dashboards (KX Dashboards)
-
-These are intentionally deferred until ingestion, schema, and measurement are fully validated.
-
----
-
-## Design Philosophy
-
-- Event-driven, not batch
-- Measure before optimising
-- Separate correctness from performance
-- Prefer explicit decisions over implicit assumptions
-- Documentation is part of the system
-
----
+| Table | Contents |
+|-------|----------|
+| `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) |
+| `telemetry_latency_e2e` | Cross-process latencies (FH→TP→RDB) |
+| `telemetry_throughput` | Trade counts and volumes |
 
 ## Project Structure
 
-```text
+```
 .
 ├── CMakeLists.txt
 ├── src/
 │   ├── main.cpp
-│   └── feed_handler.cpp
+│   └── feed_handler.cpp          # C++ WebSocket client + IPC publisher
 ├── kdb/
-│   └── tp.q
-├── docs/
-│   ├── api-binance.md
-│   ├── kdbx-real-time-architecture-reference.md
-│   ├── kdbx-real-time-architecture-measurement-notes.md
-│   ├── specs/
-│   │   └── trades-schema.md
-│   └── decisions/
-│       ├── adr-001-timestamps-and-latency-measurement.md
-│       ├── adr-002-feed-handler-to-tickerplant.md
-│       ├── adr-003-ingestion-without-logfile.md
-│       ├── adr-004-schema-normalisation.md
-│       ├── adr-005-telemetry-vs-market-data.md
-│       ├── adr-006-recovery-scope.md
-│       └── adr-007-visualisation-strategy.md
+│   ├── tp.q                      # Tickerplant with pub/sub
+│   └── rdb.q                     # RDB with telemetry aggregation
+├── third_party/
+│   └── kdb/
+│       ├── k.h                   # kdb+ C API header
+│       └── c.o                   # kdb+ C API library
+└── docs/
+    ├── README.md
+    ├── kdbx-real-time-architecture-reference.md
+    ├── kdbx-real-time-architecture-measurement-notes.md
+    ├── api-binance.md
+    ├── specs/
+    │   └── trades-schema.md      # Canonical schema definition
+    └── decisions/
+        ├── adr-001-timestamps-and-latency-measurement.md
+        ├── adr-002-feed-handler-to-kdb-ingestion-path.md
+        ├── adr-003-tickerplant-logging-and-durability-strategy.md
+        ├── adr-004-real-time-rolling-analytics-computation.md
+        ├── adr-005-telemetry-and-metrics-aggregation-strategy.md
+        ├── adr-006-recovery-and-replay-strategy.md
+        └── adr-007-visualisation-and-consumption-strategy.md
+```
 
+## Design Principles
+
+- **Documentation-first**: Architecture decisions documented before code
+- **Measurement discipline**: Latency captured at every stage with explicit trust model
+- **Event-driven**: Tick-by-tick processing, no batching
+- **Separation of concerns**: FH (ingestion) → TP (distribution) → RDB (storage/analytics)
+- **Ephemeral by design**: No persistence; focus on real-time behaviour
+
+## Implementation Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Feed Handler | ✓ Complete | WebSocket, JSON parse, monotonic timing, sequence numbers |
+| Tickerplant | ✓ Complete | Pub/sub, timestamp capture, subscriber management |
+| RDB | ✓ Complete | Subscription, timestamp capture, telemetry aggregation |
+| RTE | Planned | Rolling analytics (avgPrice, tradeCount) |
+| Dashboards | Planned | KX Dashboards visualisation |
+
+## Dependencies
+
+- **C++17** compiler (GCC/Clang)
+- **CMake** 3.16+
+- **Boost** (Beast, Asio)
+- **OpenSSL**
+- **RapidJSON**
+- **kdb+** 4.x (with valid license)
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| [Architecture Reference](docs/kdbx-real-time-architecture-reference.md) | Design patterns for real-time KDB-X systems |
+| [Measurement Notes](docs/kdbx-real-time-architecture-measurement-notes.md) | Latency measurement definitions and trust model |
+| [Trades Schema](docs/specs/trades-schema.md) | Canonical schema with all 14 fields |
+| [ADRs](docs/decisions/) | Architecture Decision Records |
+
+## Typical Latencies (Single Host)
+
+| Segment | Typical p99 |
+|---------|-------------|
+| FH parse | 10-50 µs |
+| FH send | 1-10 µs |
+| FH → TP | 0.1-0.5 ms |
+| TP → RDB | 0.01-0.1 ms |
+| **End-to-end** | **< 1 ms** |
+
+## License
+
+This project is for educational and exploratory purposes.
+
+## Acknowledgements
+
+Architecture patterns derived from [Building Real Time Event Driven KDB-X Systems](https://dataintellect.com/) by Data Intellect.

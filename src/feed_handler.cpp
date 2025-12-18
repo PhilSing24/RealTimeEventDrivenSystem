@@ -40,21 +40,28 @@ int run_feed_handler() {
 
     std::cout << "Connected to Binance trade stream\n";
 
-    // ---- connect to tickerplant ----
+    // ---- Connect to tickerplant ----
     int tp = khpu((S)"localhost", 5010, (S)"");
     if (tp < 0) {
         std::cerr << "Failed to connect to tickerplant\n";
         return 1;
     }
 
+    // ---- Sequence number: monotonically increasing per FH instance ----
+    long long fhSeqNo = 0;
+
     for (;;) {
         beast::flat_buffer buffer;
         ws.read(buffer);
 
+        // ---- Wall-clock timestamp: for cross-process correlation ----
         auto recvWall = std::chrono::system_clock::now();
         long long fhRecvTimeUtcNs =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 recvWall.time_since_epoch()).count();
+
+        // ---- Monotonic timestamp: start of parse/normalise ----
+        auto parseStart = std::chrono::steady_clock::now();
 
         std::string msg = beast::buffers_to_string(buffer.data());
 
@@ -72,27 +79,51 @@ int run_feed_handler() {
         long long exchEventTimeMs = d["E"].GetInt64();
         long long exchTradeTimeMs = d["T"].GetInt64();
 
+        // ---- Monotonic timestamp: end of parse/normalise ----
+        auto parseEnd = std::chrono::steady_clock::now();
+        long long fhParseUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            parseEnd - parseStart).count();
+
+        // ---- Increment sequence number ----
+        ++fhSeqNo;
+
+        // ---- Build kdb row (this is "send preparation") ----
+        // Row ordered to match table schema in tp.q
+        K row = knk(12,
+            ktj(-KP, fhRecvTimeUtcNs),       // time (placeholder; TP may overwrite)
+            ks((S)sym),                       // sym
+            kj(tradeId),                      // tradeId
+            kf(price),                        // price
+            kf(qty),                          // qty
+            kb(buyerIsMaker),                 // buyerIsMaker
+            kj(exchEventTimeMs),              // exchEventTimeMs
+            kj(exchTradeTimeMs),              // exchTradeTimeMs
+            kj(fhRecvTimeUtcNs),              // fhRecvTimeUtcNs
+            kj(fhParseUs),                    // fhParseUs
+            kj(0LL),                          // fhSendUs (placeholder)
+            kj(fhSeqNo)                       // fhSeqNo
+        );
+
+        // ---- Monotonic timestamp: end of send preparation ----
+        auto sendEnd = std::chrono::steady_clock::now();
+        long long fhSendUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            sendEnd - parseEnd).count();
+
+        // Update fhSendUs in the row (index 10)
+        kK(row)[10]->j = fhSendUs;
+
         std::cout
-            << "symbol=" << sym
+            << "sym=" << sym
             << " tradeId=" << tradeId
             << " price=" << price
             << " qty=" << qty
+            << " fhParseUs=" << fhParseUs
+            << " fhSendUs=" << fhSendUs
+            << " fhSeqNo=" << fhSeqNo
             << std::endl;
 
-        // build kdb row (ordered to match table schema)
-        K row = knk(9,
-            ktj(-KP, fhRecvTimeUtcNs),     // time (placeholder, TP overwrites if desired)
-            ks((S)sym),
-            kj(tradeId),
-            kf(price),
-            kf(qty),
-            kb(buyerIsMaker),
-            kj(exchEventTimeMs),
-            kj(exchTradeTimeMs),
-            kj(fhRecvTimeUtcNs)
-        );
-
-        k(tp, (S)".u.upd", ks((S)"trade_binance"), row, (K)0);
+        // ---- IPC send to tickerplant ----
+        k(-tp, (S)".u.upd", ks((S)"trade_binance"), row, (K)0);
     }
 
     return 0;

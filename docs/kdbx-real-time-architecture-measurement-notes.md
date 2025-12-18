@@ -37,6 +37,8 @@ Binance ──► FH ──► TP ──► RDB
                     └──► RTE
 ```
 
+**Current status:** FH → TP → RDB pipeline fully instrumented. RTE is future work.
+
 ### Upstream (Binance)
 
 | Point | Field Name | Source | Unit | Description |
@@ -67,10 +69,11 @@ Notes:
 
 | Point | Field Name | Clock Type | Unit | Description |
 |-------|------------|------------|------|-------------|
-| TP receive time | `tpRecvTimeUtc` | Wall-clock | kdb timestamp | When TP receives message (`.z.p`) |
+| TP receive time | `tpRecvTimeUtcNs` | Wall-clock | ns since epoch | When TP receives message (`.z.p` converted) |
 
 Notes:
-- Captured in `.z.ps` handler
+- Captured in `.u.upd` handler
+- Converted from `.z.p` to nanoseconds since Unix epoch
 - Used for FH-to-TP latency calculation
 
 **Not implemented (ADR-003):**
@@ -83,40 +86,42 @@ Notes:
 
 | Point | Field Name | Clock Type | Unit | Description |
 |-------|------------|------------|------|-------------|
-| RDB apply time | `rdbApplyTimeUtc` | Wall-clock | kdb timestamp | When update becomes query-consistent |
+| RDB apply time | `rdbApplyTimeUtcNs` | Wall-clock | ns since epoch | When update becomes query-consistent |
 
 Notes:
-- Captured after `upd` function completes
+- Captured at start of `.u.upd` handler before insert
 - Represents end of core pipeline (data queryable)
+- Used for TP-to-RDB and E2E latency calculation
 
 ### Real-Time Engine
 
 | Point | Field Name | Clock Type | Unit | Description |
 |-------|------------|------------|------|-------------|
-| RTE receive time | `rteRecvTimeUtc` | Wall-clock | kdb timestamp | When RTE receives update from TP |
+| RTE receive time | `rteRecvTimeUtcNs` | Wall-clock | ns since epoch | When RTE receives update from TP |
 | RTE compute time | `rteComputeUs` | Monotonic | microseconds | Duration of analytics computation |
-| RTE publish time | `rtePublishTimeUtc` | Wall-clock | kdb timestamp | When analytics become query-consistent |
+| RTE publish time | `rtePublishTimeUtcNs` | Wall-clock | ns since epoch | When analytics become query-consistent |
 
 Notes:
 - RTE subscribes directly to TP (peer to RDB)
 - `rteComputeUs` measures rolling analytics update time
-- `rtePublishTimeUtc` represents end of analytics pipeline
+- `rtePublishTimeUtcNs` represents end of analytics pipeline
+- **Not yet implemented** — future step
 
 ## Field Mapping Summary
 
-| Measurement Point | ADR-001 Field | Stored In | Notes |
-|-------------------|---------------|-----------|-------|
-| Exchange event time | `exchEventTimeMs` | `trade_binance` | From Binance |
-| Exchange trade time | `exchTradeTimeMs` | `trade_binance` | From Binance |
-| FH receive | `fhRecvTimeUtcNs` | `trade_binance` | Nanoseconds |
-| FH parse duration | `fhParseUs` | `trade_binance` | Microseconds |
-| FH send duration | `fhSendUs` | `trade_binance` | Microseconds |
-| FH sequence | `fhSeqNo` | `trade_binance` | Integer |
-| TP receive | `tpRecvTimeUtc` | `trade_binance` | kdb timestamp |
-| RDB apply | `rdbApplyTimeUtc` | `trade_binance` | kdb timestamp |
-| RTE receive | `rteRecvTimeUtc` | Internal | Optional |
-| RTE compute | `rteComputeUs` | Telemetry | Optional |
-| RTE publish | `rtePublishTimeUtc` | Internal | Optional |
+| Measurement Point | Field Name | Stored In | Status |
+|-------------------|------------|-----------|--------|
+| Exchange event time | `exchEventTimeMs` | `trade_binance` | ✓ Implemented |
+| Exchange trade time | `exchTradeTimeMs` | `trade_binance` | ✓ Implemented |
+| FH receive | `fhRecvTimeUtcNs` | `trade_binance` | ✓ Implemented |
+| FH parse duration | `fhParseUs` | `trade_binance` | ✓ Implemented |
+| FH send duration | `fhSendUs` | `trade_binance` | ✓ Implemented |
+| FH sequence | `fhSeqNo` | `trade_binance` | ✓ Implemented |
+| TP receive | `tpRecvTimeUtcNs` | `trade_binance` | ✓ Implemented |
+| RDB apply | `rdbApplyTimeUtcNs` | `trade_binance` | ✓ Implemented |
+| RTE receive | `rteRecvTimeUtcNs` | Internal | Future |
+| RTE compute | `rteComputeUs` | Telemetry | Future |
+| RTE publish | `rtePublishTimeUtcNs` | Internal | Future |
 
 ## Segment Latency Definitions
 
@@ -132,23 +137,24 @@ These are derived from monotonic clock and are **always trusted** regardless of 
 
 ### Cross-Process Segments (Wall-Clock — Trust Depends on Sync)
 
-| Segment | Definition | Formula | Notes |
-|---------|------------|---------|-------|
-| `market_to_fh_ms` | Binance to FH receive | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` | Indicative; includes network + exchange semantics |
-| `fh_to_tp_ms` | FH send to TP receive | `tpRecvTimeUtc - fhRecvTimeUtc` | Requires unit conversion |
-| `tp_to_rdb_ms` | TP receive to RDB apply | `rdbApplyTimeUtc - tpRecvTimeUtc` | |
-| `tp_to_rte_ms` | TP receive to RTE receive | `rteRecvTimeUtc - tpRecvTimeUtc` | Optional |
-| `rte_compute_us` | RTE analytics computation | `rteComputeUs` (captured directly) | Monotonic |
-| `e2e_to_rdb_ms` | FH receive to RDB apply | `rdbApplyTimeUtc - fhRecvTimeUtc` | Full ingestion pipeline |
-| `e2e_to_rte_ms` | FH receive to RTE publish | `rtePublishTimeUtc - fhRecvTimeUtc` | Full analytics pipeline |
+All timestamps use nanoseconds since epoch. Unit conversions are explicit.
+
+| Segment | Definition | Formula | Status |
+|---------|------------|---------|--------|
+| `market_to_fh_ms` | Binance to FH receive | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` | ✓ Measurable (indicative) |
+| `fh_to_tp_ms` | FH send to TP receive | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | ✓ Measurable |
+| `tp_to_rdb_ms` | TP receive to RDB apply | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | ✓ Measurable |
+| `e2e_to_rdb_ms` | FH receive to RDB apply | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | ✓ Measurable |
+| `tp_to_rte_ms` | TP receive to RTE receive | `(rteRecvTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | Future |
+| `e2e_to_rte_ms` | FH receive to RTE publish | `(rtePublishTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Future |
 
 ### Unit Conversions
 
 | From | To | Conversion |
 |------|-----|------------|
-| Nanoseconds | Milliseconds | Divide by 1,000,000 |
-| Microseconds | Milliseconds | Divide by 1,000 |
-| kdb timestamp | Milliseconds since epoch | Standard kdb conversion |
+| Nanoseconds | Milliseconds | Divide by 1,000,000 (1e6) |
+| Microseconds | Milliseconds | Divide by 1,000 (1e3) |
+| kdb timestamp | Nanoseconds since epoch | `946684800000000000 + "j"$ts - 2000.01.01D0` |
 
 ## Clock Types
 
@@ -179,8 +185,8 @@ These are derived from monotonic clock and are **always trusted** regardless of 
 - Subject to clock skew between hosts
 
 **Implementation:**
-- C++: `std::chrono::system_clock` (recorded as UTC)
-- kdb: `.z.p`
+- C++: `std::chrono::system_clock` (recorded as UTC nanoseconds since epoch)
+- kdb: `.z.p` converted to nanoseconds since epoch
 
 **Trust:** Depends on clock synchronisation quality.
 
@@ -257,22 +263,50 @@ SLOs should explicitly state:
 ```
 FH parse latency p99 < 100µs over 1-minute rolling window
 FH send latency p99 < 50µs over 1-minute rolling window
+FH to TP latency p99 < 5ms over 1-minute rolling window (single host)
+TP to RDB latency p99 < 1ms over 1-minute rolling window (single host)
 E2E to RDB p99 < 10ms over 1-minute rolling window (single host)
 ```
 
-## Aggregation Strategy
+## Telemetry Aggregation
 
-Latency measurements are aggregated per ADR-005:
+### Overview
+
+The RDB computes telemetry aggregations every 1 second via timer. Aggregations are stored in dedicated tables.
+
+### Telemetry Tables
+
+| Table | Contents |
+|-------|----------|
+| `telemetry_latency_fh` | FH segment latencies (parseUs, sendUs) — p50/p95/p99/max per bucket |
+| `telemetry_latency_e2e` | Cross-process latencies (fhToTp, tpToRdb, e2e) — p50/p95/p99 per bucket |
+| `telemetry_throughput` | Trade counts and volumes per bucket |
+
+### Aggregation Parameters
 
 | Parameter | Value |
 |-----------|-------|
 | Bucket size | 1 second |
 | Percentiles computed | p50, p95, p99, max |
-| Rolling windows | 1-minute, 15-minute |
 | Aggregation location | RDB |
 | Retention | 15 minutes (ephemeral) |
+| Timer interval | 1000ms |
 
-See ADR-005 for telemetry table schemas.
+### Example Queries
+
+```q
+/ Latest FH latency stats
+select from telemetry_latency_fh where bucket = max bucket
+
+/ E2E latency trend (last 5 minutes)
+select from telemetry_latency_e2e where bucket > .z.p - 0D00:05:00
+
+/ 1-minute rolling p99 for FH parse latency
+select p99_1min:avg parseUs_p99 by sym from telemetry_latency_fh where bucket > .z.p - 0D00:01:00
+
+/ Throughput over last minute
+select totalTrades:sum tradeCount, totalVolume:sum totalQty by sym from telemetry_throughput where bucket > .z.p - 0D00:01:00
+```
 
 ## Correlation and Gap Detection
 
@@ -338,31 +372,43 @@ Binance trade stream (`<symbol>@trade`) provides:
 
 ## Implementation Checklist
 
-### Feed Handler (C++)
+### Feed Handler (C++) — ✓ Complete
 
-- [ ] Capture `fhRecvTimeUtcNs` using `std::chrono::system_clock`
-- [ ] Capture monotonic start time using `std::chrono::steady_clock`
-- [ ] Compute `fhParseUs` after parse/normalise
-- [ ] Compute `fhSendUs` after IPC send initiation
-- [ ] Increment `fhSeqNo` per published message
-- [ ] Extract `E`, `T`, `t` from Binance JSON
+- [x] Capture `fhRecvTimeUtcNs` using `std::chrono::system_clock`
+- [x] Capture monotonic start time using `std::chrono::steady_clock`
+- [x] Compute `fhParseUs` after parse/normalise
+- [x] Compute `fhSendUs` after row build (before IPC send)
+- [x] Increment `fhSeqNo` per published message
+- [x] Extract `E`, `T`, `t` from Binance JSON
+- [x] Send all fields to TP in correct order
 
-### Tickerplant (q)
+### Tickerplant (q) — ✓ Complete
 
-- [ ] Capture `tpRecvTimeUtc` in `.z.ps` handler using `.z.p`
-- [ ] Pass timestamp to downstream with trade data
+- [x] Implement pub/sub infrastructure (`.u.w`, `.u.sub`, `.u.pub`)
+- [x] Capture `tpRecvTimeUtcNs` in `.u.upd` handler using `.z.p`
+- [x] Convert `.z.p` to nanoseconds since epoch
+- [x] Add `tpRecvTimeUtcNs` to schema
+- [x] Pass timestamp to downstream with trade data
+- [x] Handle subscriber disconnect (`.z.pc`)
 
-### RDB (q)
+### RDB (q) — ✓ Complete
 
-- [ ] Capture `rdbApplyTimeUtc` after `upd` completes
-- [ ] Store all timestamp fields in `trade_binance` table
-- [ ] Compute telemetry aggregations on 1-second timer
+- [x] Implement proper subscription to TP
+- [x] Capture `rdbApplyTimeUtcNs` in `.u.upd` handler
+- [x] Add `rdbApplyTimeUtcNs` to schema
+- [x] Store all timestamp fields in `trade_binance` table
+- [x] Implement telemetry tables (`telemetry_latency_fh`, `telemetry_latency_e2e`, `telemetry_throughput`)
+- [x] Compute telemetry aggregations on 1-second timer
+- [x] Implement 15-minute telemetry retention cleanup
 
-### RTE (q)
+### RTE (q) — Future
 
-- [ ] Capture `rteRecvTimeUtc` on update receipt (optional)
-- [ ] Capture `rteComputeUs` for analytics duration (optional)
-- [ ] Capture `rtePublishTimeUtc` when analytics ready (optional)
+- [ ] Subscribe to TP
+- [ ] Capture `rteRecvTimeUtcNs` on update receipt
+- [ ] Implement rolling analytics (avgPrice, tradeCount)
+- [ ] Capture `rteComputeUs` for analytics duration
+- [ ] Capture `rtePublishTimeUtcNs` when analytics ready
+- [ ] Implement validity indicators (`isValid`, `fillPct`)
 
 ## Links / References
 

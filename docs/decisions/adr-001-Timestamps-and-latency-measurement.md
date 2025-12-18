@@ -93,28 +93,36 @@ The sequence number is recommended (not optional) because it:
 
 | Field | Description | Unit |
 |-------|-------------|------|
-| `tpRecvTimeUtc` | TP receive time captured at ingest (`.z.p`) | kdb timestamp |
-| `rdbApplyTimeUtc` | Time the update becomes query-consistent in the RDB | kdb timestamp |
+| `tpRecvTimeUtcNs` | TP receive time captured at ingest (`.z.p` converted to nanoseconds since epoch) | nanoseconds since epoch |
+| `rdbApplyTimeUtcNs` | Time the update becomes query-consistent in the RDB (nanoseconds since epoch) | nanoseconds since epoch |
 
-### 3) Schema Hygiene
-To avoid polluting core market-data tables with excessive timing columns:
+### 3) Schema and Storage
 
-**Market data table (e.g., `trade_binance`) stores:**
+For this exploratory project, all timestamp and latency fields are stored **per-event** in the market data table (`trade_binance`). This simplifies implementation and enables direct correlation between specific trades and their latency characteristics during debugging.
+
+**Market data table (`trade_binance`) stores:**
 - `exchEventTimeMs`
 - `exchTradeTimeMs`
 - `fhRecvTimeUtcNs`
+- `fhParseUs`
+- `fhSendUs`
 - `fhSeqNo`
 - `tradeId`
 - Normalised business fields (sym, price, qty, side, etc.)
-- `tpRecvTimeUtc`
+- `tpRecvTimeUtcNs`
+- `rdbApplyTimeUtcNs`
 
-**Telemetry table (e.g., `telemetry_latency_fh`) stores aggregated metrics:**
+**Telemetry tables store aggregated metrics:**
 - Time bucket (e.g., per-second)
 - Event counts
-- Latency percentiles for `fhParseUs` and `fhSendUs`
+- Latency percentiles computed from per-event fields
 - Max values for spike detection
 
-Rationale: store per-event wall-clock once (for correlation), but store performance metrics in aggregated form to manage volume.
+Rationale for per-event storage:
+- Exploratory project with single user; schema "pollution" is not a concern
+- Enables debugging specific trades with their exact latency values
+- Simplifies implementation (single message path, no separate telemetry routing)
+- Aggregation is still performed for dashboard consumption (see ADR-005)
 
 ### 4) Latency Metrics Definitions
 
@@ -127,12 +135,14 @@ Rationale: store per-event wall-clock once (for correlation), but store performa
 
 **Cross-process latencies (wall-clock-derived, trust depends on clock sync):**
 
-| Metric | Definition | Notes |
-|--------|------------|-------|
-| `market_to_fh_ms` | `(fhRecvTimeUtcNs / 1,000,000) - exchEventTimeMs` | Indicative only; includes network + exchange semantics; may be negative if clocks are misaligned |
-| `fh_to_tp_ms` | `tpRecvTimeUtc - fhRecvTimeUtc` | Requires unit conversion |
-| `tp_to_rdb_ms` | `rdbApplyTimeUtc - tpRecvTimeUtc` | |
-| `e2e_system_ms` | `rdbApplyTimeUtc (or rtePublishTime) - fhRecvTimeUtc` | Full system latency |
+All timestamps use nanoseconds since epoch. Unit conversions are explicit in formulas.
+
+| Metric | Definition | Formula | Notes |
+|--------|------------|---------|-------|
+| `market_to_fh_ms` | Binance to FH receive | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` | Indicative only; includes network + exchange semantics; may be negative if clocks are misaligned |
+| `fh_to_tp_ms` | FH send to TP receive | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Same-unit subtraction, then convert to ms |
+| `tp_to_rdb_ms` | TP receive to RDB apply | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | |
+| `e2e_system_ms` | FH receive to RDB apply | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | Full system latency |
 
 ### 5) SLO Expression and Aggregation Windows
 
@@ -194,14 +204,15 @@ SLOs should explicitly state:
 ### Positive
 - Reliable feed handler latency measurement independent of wall-clock adjustments.
 - Clear separation between correlation timestamps (wall-clock) and performance timings (monotonic durations).
-- Market data schema remains clean; performance monitoring scales via telemetry aggregates.
+- Per-event storage enables precise debugging and correlation.
+- Explicit unit naming (`*Ns`, `*Ms`, `*Us`) prevents conversion errors.
 - Explicit SLO percentiles and windows provide clear targets for measurement.
 - Sequence numbers support future recovery/replay without schema changes.
 
 ### Negative / Trade-offs
 - End-to-end latency across hosts can be misleading without good clock sync; requires explicit trust rules and monitoring.
+- Per-event latency fields increase storage volume (acceptable for exploratory project).
 - Additional instrumentation effort in both FH and TP/RDB.
-- Telemetry aggregation provides less per-event detail (by design).
 - Sequence number adds a small amount of state to the feed handler.
 
 ## Links / References
