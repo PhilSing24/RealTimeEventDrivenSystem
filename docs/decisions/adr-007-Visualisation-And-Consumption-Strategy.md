@@ -10,62 +10,197 @@ Accepted
 
 The system produces:
 - Real-time market data (Binance trades)
-- Derived analytics (e.g. rolling average price)
+- Derived analytics (rolling average price, trade count)
 - Telemetry and latency metrics
 
 These outputs must be:
-- Observable by humans
-- Suitable for operational inspection
-- Easy to iterate on during development
+- Observable by humans during development and operation
+- Suitable for validating system behaviour
+- Easy to iterate on during exploration
 
-Multiple visualisation approaches are possible, including:
-- Custom UI builds
-- External BI tools
-- Streaming dashboards
-- Built-in KDB-X visualisation tooling
+Multiple visualisation approaches are possible:
+
+| Approach | Description |
+|----------|-------------|
+| Custom UI builds | Bespoke web or desktop application |
+| External BI tools | Grafana, Tableau, etc. |
+| Streaming dashboards | Push-based real-time updates |
+| KX Dashboards | Native KDB-X visualisation tooling |
+
+A decision is required on how system outputs are visualised and consumed.
+
+## Notation
+
+| Acronym | Definition |
+|---------|------------|
+| FH | Feed Handler |
+| IPC | Inter-Process Communication |
+| RDB | Real-Time Database |
+| RTE | Real-Time Engine |
+| TP | Tickerplant |
 
 ## Decision
 
-The project will use **KX Dashboards** as the primary visualisation and consumption mechanism.
+The project will use **KX Dashboards** as the primary visualisation mechanism, with **polling-based queries** at **1-second intervals**.
 
-Specifically:
-- Market data and derived analytics will be visualised in KX Dashboards
-- Telemetry and latency metrics will be visualised alongside business metrics
-- Initial dashboards will use **polling-based queries**
-- Streaming visualisations may be introduced later if required
+### Visualisation Technology
 
-## Scope of Visualisation
+**KX Dashboards** is selected because:
+- Native to the KDB-X ecosystem
+- Requires minimal integration effort
+- Supports time-series and real-time analytics well
+- Well-suited for exploratory and diagnostic workflows
+- No additional infrastructure required
 
-Dashboards will display, at minimum, the following **per symbol (BTCUSDT, ETHUSDT)**:
+### Data Delivery Model
 
-### Market Metrics
-- **Last traded price**
-- **Rolling average price** (over the configured window, e.g. last N minutes)
-- Trade rate (events/sec)
+**Polling (pull-based)** is selected over streaming (push-based):
 
-### Telemetry Metrics
-- Feed handler latency percentiles (p50 / p95 / p99)
-- Event throughput
-- Basic health indicators (e.g. data freshness)
+| Factor | Polling | Streaming |
+|--------|---------|-----------|
+| Implementation complexity | Simple | Complex |
+| Server-side requirements | None | Subscription management |
+| Recovery handling | Automatic (next poll) | Must handle reconnect |
+| Update granularity | Poll interval | Per-event possible |
 
-The intent is to allow immediate visual comparison between:
-- The most recent market price
-- The smoothed analytical view (rolling average)
+Polling is appropriate because:
+- Simpler to implement
+- Sufficient for human-scale observation
+- Avoids premature optimisation
+- Aligns with exploratory project goals
 
-## Rationale
+### Polling Frequency
 
-KX Dashboards:
-- Are native to the KDB-X ecosystem
-- Require minimal integration effort
-- Support time-series and real-time analytics well
-- Are well-suited for exploratory and diagnostic workflows
+**1-second polling interval** is selected:
 
-Polling is chosen initially because:
-- It is simpler to implement
-- It avoids premature optimisation
-- It is sufficient for human-scale update rates
+| Frequency | Trade-off |
+|-----------|-----------|
+| 200ms | Minimum for human perception; highest load |
+| 500ms | Good responsiveness; moderate load |
+| **1 second** | **Balanced; aligns with telemetry buckets (ADR-005)** |
+| 5 seconds | Low load; sluggish feel |
 
-## Intended Usage
+Rationale:
+- Matches ADR-005 telemetry bucket granularity (1 second)
+- Each poll retrieves fresh telemetry data
+- Acceptable responsiveness for development use
+- Minimal query load on RDB/RTE
+
+### Query Targets
+
+Dashboards query **both RDB and RTE**:
+```
+┌─────────────┐
+│  Dashboard  │
+└──────┬──────┘
+       │
+       ├────► RDB (raw trades, telemetry tables)
+       │
+       └────► RTE (rolling analytics, validity flags)
+```
+
+| Data | Source | Table/Query |
+|------|--------|-------------|
+| Last trade price | RDB | `trade_binance` |
+| Raw trade history | RDB | `trade_binance` |
+| FH latency metrics | RDB | `telemetry_latency_fh` |
+| E2E latency metrics | RDB | `telemetry_latency_e2e` |
+| Throughput metrics | RDB | `telemetry_throughput` |
+| System health | RDB | `telemetry_health` |
+| Rolling average price | RTE | `rollAnalytics` |
+| Rolling trade count | RTE | `rollAnalytics` |
+| Analytics validity | RTE | `rollAnalytics` |
+
+**Trade-off acknowledged:** The reference architecture recommends:
+> "Processes accessed by users should be isolated from those performing core system calculations to improve stability and resource control."
+
+For this exploratory project with a single user, direct querying is acceptable. A UI cache or gateway would be introduced if user count grows.
+
+### Dashboard Specification
+
+Three dashboards are defined:
+
+**Dashboard 1: Market Overview**
+
+| Panel | Data Source | Content | Update |
+|-------|-------------|---------|--------|
+| Last Price | RDB | Most recent trade price per symbol | 1 sec |
+| Rolling Avg Price | RTE | `avgPrice` from `rollAnalytics` | 1 sec |
+| Trade Count | RTE | `tradeCount` from `rollAnalytics` | 1 sec |
+| Price Chart | RDB | Time series of recent prices (last 5 min) | 1 sec |
+| Validity Indicator | RTE | `isValid`, `fillPct` display | 1 sec |
+
+**Dashboard 2: Latency Monitor**
+
+| Panel | Data Source | Content | Update |
+|-------|-------------|---------|--------|
+| FH Parse Latency | RDB | p50/p95/p99 from `telemetry_latency_fh` | 1 sec |
+| FH Send Latency | RDB | p50/p95/p99 from `telemetry_latency_fh` | 1 sec |
+| E2E Latency | RDB | p50/p95/p99 from `telemetry_latency_e2e` | 1 sec |
+| Latency Time Series | RDB | Rolling chart of percentiles (last 5 min) | 1 sec |
+| Throughput Chart | RDB | Events/sec from `telemetry_throughput` | 1 sec |
+
+**Dashboard 3: System Health**
+
+| Panel | Data Source | Content | Update |
+|-------|-------------|---------|--------|
+| Component Status | RDB | Status from `telemetry_health` | 1 sec |
+| Last Update Time | RDB/RTE | Freshness indicator per component | 1 sec |
+| Data Freshness | RDB | Time since last trade per symbol | 1 sec |
+| Gap Indicator | RDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
+
+### Validity Display
+
+Analytics validity (from ADR-004) is displayed using visual indicators:
+
+| Condition | Display |
+|-----------|---------|
+| `isValid = true` | Green indicator; normal value display |
+| `isValid = false`, `fillPct > 50%` | Yellow indicator; value shown with warning |
+| `isValid = false`, `fillPct <= 50%` | Red indicator; value greyed out or hidden |
+
+Additionally:
+- `fillPct` shown as percentage or progress bar
+- `windowStart` shown to indicate data coverage
+- Tooltip explains validity meaning on hover
+
+### Update Latency Expectations
+
+| Metric | Source | Target Latency (data age) |
+|--------|--------|---------------------------|
+| Last price | RDB | < 2 seconds |
+| Rolling avg | RTE | < 2 seconds |
+| Telemetry | RDB | < 2 seconds |
+
+These targets are achievable with 1-second polling and account for:
+- Poll interval (up to 1 second)
+- Query execution time (< 100ms expected)
+- Rendering time (< 100ms expected)
+
+The reference architecture notes:
+> "A minimum update interval of approximately 200 milliseconds is generally sufficient, as this aligns with the threshold at which the human eye can perceive simple visual changes."
+
+1-second polling is well within acceptable bounds for human observation.
+
+### Scalability Stance
+
+**Scalability is out of scope for the current phase.**
+
+The reference architecture describes a UI caching pattern for scale:
+> "A common approach to scaling visualisation workloads is the introduction of a server-side UI cache."
+
+For this project:
+- Single user (developer) assumed
+- Direct RDB/RTE queries acceptable
+- No UI cache implemented
+- No gateway process implemented
+
+If multiple users or higher query rates are needed:
+- Introduce UI cache process
+- Cache pre-computes common queries
+- Dashboards query cache instead of RDB/RTE
+
+### Intended Usage
 
 Dashboards are intended for:
 - Development validation
@@ -73,32 +208,119 @@ Dashboards are intended for:
 - Latency and performance reasoning
 - Architecture exploration
 
-They are **not** intended as end-user trading interfaces.
+They are **not** intended as:
+- End-user trading interfaces
+- Production monitoring (no alerting)
+- Historical analysis tools
+
+### Symbol Scope
+
+Initial dashboards display data for:
+- BTCUSDT
+- ETHUSDT
+
+Each symbol has dedicated panels or can be filtered via dashboard controls.
+
+## Rationale
+
+KX Dashboards with polling was selected because:
+
+- **Native integration** — No additional tooling or infrastructure required
+- **Rapid development** — Pre-built components for time-series visualisation
+- **Sufficient for purpose** — Human-scale observation doesn't require streaming
+- **Alignment with project goals** — Exploratory, not production-grade
+- **Consistency** — Data stays within KDB-X ecosystem
+
+## Alternatives Considered
+
+### 1. Streaming dashboards
+Rejected for current phase:
+- Adds complexity (subscription management, reconnection)
+- Not required for single-user development use
+- Premature optimisation
+
+May be introduced if real-time push updates become necessary.
+
+### 2. External BI tools (Grafana, Tableau)
+Rejected:
+- Requires additional infrastructure
+- Integration overhead
+- Distracts from core kdb exploration
+
+Grafana may be considered for production monitoring in future phases.
+
+### 3. Custom web UI
+Rejected:
+- Significant development effort
+- Out of scope for exploratory project
+- KX Dashboards sufficient for current needs
+
+### 4. Query on-demand only (no dashboards)
+Rejected:
+- Poor developer experience
+- Manual queries tedious for continuous observation
+- Dashboards add minimal overhead
+
+### 5. Dedicated UI cache/gateway
+Rejected for current phase:
+- Adds process complexity
+- Single user doesn't require isolation
+- Direct queries acceptable at current scale
+
+May be introduced if user count grows.
+
+### 6. Faster polling (200ms)
+Rejected:
+- Higher query load
+- Misaligned with 1-second telemetry buckets
+- No perceptible benefit for human observation
+
+### 7. Slower polling (5 seconds)
+Rejected:
+- Sluggish feel during development
+- Delays in observing system behaviour
+- 1-second provides better responsiveness
 
 ## Consequences
 
 ### Positive
+
 - Rapid feedback during development
 - Clear visibility into both raw and derived data
 - Tight integration with kdb analytics
+- Minimal infrastructure requirements
+- Aligned with telemetry bucket granularity
+- Validity indicators aid interpretation
+- Simple polling model easy to debug
 
-### Trade-offs
-- Polling introduces redundant queries
-- Dashboards are not optimised for large user populations
+### Negative / Trade-offs
+
+- Polling introduces redundant queries (even when data unchanged)
+- Dashboards not optimised for large user populations
 - Fine-grained UI customisation is limited
+- Direct RDB/RTE queries mix user and system load
+- No alerting capability (human must observe)
+- 1-second latency may feel slow for some use cases
 
 These trade-offs are acceptable for the current phase.
 
-## Future Considerations
+## Future Evolution
 
-Potential future evolutions include:
-- Streaming dashboards for higher update fidelity
-- Dedicated UI cache layer
-- External visualisation tools (Grafana, custom web UI)
-
-Any such change will be documented via a new ADR.
+| Enhancement | Trigger |
+|-------------|---------|
+| Streaming dashboards | Need for sub-second updates |
+| UI cache layer | Multiple concurrent users |
+| Gateway process | Query isolation requirement |
+| Grafana integration | Production monitoring needs |
+| Custom web UI | Specific UX requirements |
+| Alerting | Production deployment |
+| Historical dashboards | HDB implementation (ADR-003 evolution) |
 
 ## Links / References
-- `docs/kdbx-real-time-architecture-reference.md`
-- `docs/kdbx-real-time-architecture-measurement-notes.md`
-- `docs/decisions/adr-005-telemetry-and-metrics-aggregation-strategy.md`
+
+- `../kdbx-real-time-architecture-reference.md`
+- `../kdbx-real-time-architecture-measurement-notes.md`
+- `adr-001-timestamps-and-latency-measurement.md` (latency metrics definitions)
+- `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics, validity flags)
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (telemetry tables, bucket alignment)
+- `adr-006-recovery-and-replay-strategy.md` (gap detection display)
