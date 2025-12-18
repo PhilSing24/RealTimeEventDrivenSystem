@@ -10,7 +10,7 @@ Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──► RDB
                                                 └──► (RTE - future)
 ```
 
-- Ingests **real-time trade data** from Binance (BTCUSDT)
+- Ingests **real-time trade data** from Binance (BTCUSDT, ETHUSDT)
 - Captures **latency measurements** at every pipeline stage
 - Publishes via **IPC** to a kdb+ tickerplant with pub/sub
 - Stores trades with **full instrumentation** (14 timestamp/latency fields)
@@ -36,8 +36,8 @@ cmake --build build
 In the RDB terminal (Terminal 2):
 
 ```q
-/ Check data is flowing
-count trade_binance
+/ Check data is flowing (both symbols)
+select count i by sym from trade_binance
 
 / View recent trades with latencies
 select sym, tradeId, fhParseUs, fhSendUs, 
@@ -45,9 +45,25 @@ select sym, tradeId, fhParseUs, fhSendUs,
     tpToRdbMs:(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) % 1e6
     from -5#trade_binance
 
-/ View telemetry (after a few seconds)
+/ View telemetry by symbol (after a few seconds)
 select from telemetry_latency_e2e
 ```
+
+## Configuration
+
+### Adding/Removing Symbols
+
+Edit the `SYMBOLS` vector in `src/feed_handler.cpp`:
+
+```cpp
+const std::vector<std::string> SYMBOLS = {
+    "btcusdt",
+    "ethusdt"
+    // Add more symbols here (lowercase)
+};
+```
+
+Rebuild and restart the feed handler. No changes needed to TP or RDB.
 
 ## Architecture
 
@@ -71,9 +87,9 @@ select from telemetry_latency_e2e
 
 | Table | Contents |
 |-------|----------|
-| `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) |
-| `telemetry_latency_e2e` | Cross-process latencies (FH→TP→RDB) |
-| `telemetry_throughput` | Trade counts and volumes |
+| `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) by symbol |
+| `telemetry_latency_e2e` | Cross-process latencies (FH→TP→RDB) by symbol |
+| `telemetry_throughput` | Trade counts and volumes by symbol |
 
 ## Project Structure
 
@@ -119,7 +135,7 @@ select from telemetry_latency_e2e
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Feed Handler | ✓ Complete | WebSocket, JSON parse, monotonic timing, sequence numbers |
+| Feed Handler | ✓ Complete | Multi-symbol, config-driven, full instrumentation |
 | Tickerplant | ✓ Complete | Pub/sub, timestamp capture, subscriber management |
 | RDB | ✓ Complete | Subscription, timestamp capture, telemetry aggregation |
 | RTE | Planned | Rolling analytics (avgPrice, tradeCount) |
