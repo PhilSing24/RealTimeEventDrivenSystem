@@ -1,106 +1,202 @@
 # Spec: Binance Trades Schema (Canonical)
 
 ## Purpose
-Define the canonical schema for Binance trade events as stored in kdb+/KDB-X, including keys, types, and timestamp semantics.
 
-## Naming
-- Tables: snake_case (e.g., `trade_binance`)
-- Columns: lowerCamelCase (e.g., `exchTradeTimeMs`, `buyerIsMaker`)
-- All timestamps are UTC; units are encoded in the field name (Ms, Ns, Us).
+Define the canonical schema for Binance trade events as stored in kdb+/KDB-X, including keys, types, timestamp semantics, and instrumentation fields.
 
-## Source Event (Binance)
-Relevant fields:
-- e (event type)
-- E (event time, ms since epoch)
-- T (trade time, ms since epoch)
-- s (symbol)
-- t (trade id)
-- p (price)
-- q (quantity)
-- m (buyer is maker)
+## Naming Conventions
+
+| Element | Convention | Example |
+|---------|------------|---------|
+| Tables | snake_case | `trade_binance` |
+| Columns | lowerCamelCase | `exchTradeTimeMs`, `buyerIsMaker` |
+| Timestamps | Unit suffix | `Ms` (milliseconds), `Ns` (nanoseconds), `Us` (microseconds) |
+| Time zone | UTC | All timestamps are UTC |
+
+## Source Event (Binance WebSocket)
+
+The Binance `<symbol>@trade` stream provides:
+
+| JSON Field | Type | Description |
+|------------|------|-------------|
+| `e` | string | Event type (always `"trade"`) |
+| `E` | long | Event time (ms since Unix epoch) |
+| `T` | long | Trade time (ms since Unix epoch) |
+| `s` | string | Symbol (e.g., `"BTCUSDT"`) |
+| `t` | long | Trade ID |
+| `p` | string | Price (numeric string) |
+| `q` | string | Quantity (numeric string) |
+| `m` | boolean | Buyer is maker |
 
 ## Target Table
-### Table name
+
+### Table Name
+
 `trade_binance`
 
-### Key / Uniqueness
-Primary uniqueness key: (`sym`, `tradeId`)
+### Primary Key
 
-### Columns
-| Column | Type | Description |
-|---|---|---|
-| time | timestamp | Tickerplant receive time (`.z.p`) when the update is accepted/logged and published. |
-| sym | symbol | Normalised symbol (e.g., `BTCUSDT`). Conventional lowercase naming retained for kdb idioms. |
-| tradeId | long | Binance trade id (`t`). Unique per symbol. |
-| price | float | Trade price (64-bit floating point). |
-| qty | float | Trade quantity (64-bit floating point). |
-| buyerIsMaker | boolean | Binance `m` (`1b` if buyer is market maker). |
-| exchEventTimeMs | long | Binance `E` (event time, ms since epoch). |
-| exchTradeTimeMs | long | Binance `T` (trade time, ms since epoch). |
-| fhRecvTimeUtcNs | long | Feed handler wall-clock receive time (ns since Unix epoch, UTC). |
-| fhParseUs | long | Feed handler parse/normalise duration (microseconds, monotonic-derived). |
-| fhSendUs | long | Feed handler send preparation duration (microseconds, monotonic-derived). |
-| fhSeqNo | long | Feed handler sequence number (monotonically increasing per FH instance). |
-| tpRecvTimeUtcNs | long | Tickerplant receive time (ns since Unix epoch, UTC). |
-| rdbApplyTimeUtcNs | long | RDB apply time when update becomes query-consistent (ns since Unix epoch, UTC). |
+Uniqueness key: `(sym, tradeId)`
+
+Used for:
+- Deduplication during reconnect/replay scenarios
+- Correlation across system components
+
+### Schema (14 Fields)
+
+| # | Column | Type | Source | Description |
+|---|--------|------|--------|-------------|
+| 1 | `time` | timestamp | FH | FH receive time, converted to kdb epoch. Used for windowing and queries. |
+| 2 | `sym` | symbol | Binance `s` | Normalised symbol (e.g., `BTCUSDT`). |
+| 3 | `tradeId` | long | Binance `t` | Binance trade ID. Unique per symbol. |
+| 4 | `price` | float | Binance `p` | Trade price (parsed from string). |
+| 5 | `qty` | float | Binance `q` | Trade quantity (parsed from string). |
+| 6 | `buyerIsMaker` | boolean | Binance `m` | `1b` if buyer is market maker. |
+| 7 | `exchEventTimeMs` | long | Binance `E` | Exchange event time (ms since Unix epoch). |
+| 8 | `exchTradeTimeMs` | long | Binance `T` | Exchange trade time (ms since Unix epoch). |
+| 9 | `fhRecvTimeUtcNs` | long | FH | FH wall-clock receive time (ns since Unix epoch). |
+| 10 | `fhParseUs` | long | FH | Parse/normalise duration (µs, monotonic). |
+| 11 | `fhSendUs` | long | FH | IPC send prep duration (µs, monotonic). |
+| 12 | `fhSeqNo` | long | FH | FH sequence number (monotonic per FH instance). |
+| 13 | `tpRecvTimeUtcNs` | long | TP | TP receive time (ns since Unix epoch). |
+| 14 | `rdbApplyTimeUtcNs` | long | RDB | RDB apply time (ns since Unix epoch). |
+
+### q Schema Definition
+
+```q
+trade_binance:([]
+  time:`timestamp$();
+  sym:`symbol$();
+  tradeId:`long$();
+  price:`float$();
+  qty:`float$();
+  buyerIsMaker:`boolean$();
+  exchEventTimeMs:`long$();
+  exchTradeTimeMs:`long$();
+  fhRecvTimeUtcNs:`long$();
+  fhParseUs:`long$();
+  fhSendUs:`long$();
+  fhSeqNo:`long$();
+  tpRecvTimeUtcNs:`long$();
+  rdbApplyTimeUtcNs:`long$()
+  )
+```
+
+## Field Categories
+
+### Business Data (Fields 1-8)
+
+Core trade information from Binance, normalised for analytics.
+
+| Field | Notes |
+|-------|-------|
+| `time` | Derived from `fhRecvTimeUtcNs`, converted to kdb epoch (2000.01.01 base). |
+| `price`, `qty` | Parsed from Binance JSON strings to 64-bit float. |
+| `exchEventTimeMs`, `exchTradeTimeMs` | Often equal for trades. Both preserved for completeness. |
+
+### Instrumentation Data (Fields 9-14)
+
+Latency measurement and correlation fields.
+
+| Field | Clock Type | Purpose |
+|-------|------------|---------|
+| `fhRecvTimeUtcNs` | Wall-clock | Cross-process correlation anchor |
+| `fhParseUs` | Monotonic | FH segment latency (always trusted) |
+| `fhSendUs` | Monotonic | FH segment latency (always trusted) |
+| `fhSeqNo` | N/A | Gap detection, ordering |
+| `tpRecvTimeUtcNs` | Wall-clock | FH→TP latency calculation |
+| `rdbApplyTimeUtcNs` | Wall-clock | TP→RDB latency, E2E latency |
 
 ## Timestamp Semantics
 
-### Upstream timestamps
-- `exchEventTimeMs` / `exchTradeTimeMs`: Binance server-side times; used for market-to-FH estimates and correlation.
+### Time Field (`time`)
 
-### Feed handler timestamps
-- `fhRecvTimeUtcNs`: Wall-clock correlation time (nanoseconds since epoch, UTC). May be impacted by clock sync quality across hosts.
-- `fhParseUs`: Duration from message receipt to parse/normalise completion. Derived from monotonic clock; always trusted.
-- `fhSendUs`: Duration from parse completion to IPC send initiation. Derived from monotonic clock; always trusted.
-- `fhSeqNo`: Sequence number for gap detection and ordering diagnostics.
+- **Source:** FH wall-clock at message receipt
+- **Conversion:** Unix epoch nanoseconds → kdb epoch timestamp
+- **Purpose:** Primary query/filter field, rolling window calculations
+- **Note:** This is a copy of `fhRecvTimeUtcNs` in kdb timestamp format
 
-### Platform timestamps
-- `time`: Tickerplant receive time (`.z.p`) used as platform-ingest time for windowing and intraday analytics.
-- `tpRecvTimeUtcNs`: Same as `time` but expressed as nanoseconds since Unix epoch for latency calculations.
-- `rdbApplyTimeUtcNs`: RDB apply time; marks when the trade is query-consistent. Used for TP-to-RDB and end-to-end latency.
+### Exchange Times (`exchEventTimeMs`, `exchTradeTimeMs`)
+
+- **Source:** Binance server
+- **Trust:** Indicative only (no clock sync with exchange)
+- **Purpose:** Market-to-FH latency estimates, event correlation
+
+### Pipeline Times (`fhRecvTimeUtcNs`, `tpRecvTimeUtcNs`, `rdbApplyTimeUtcNs`)
+
+- **Source:** Respective component wall-clock
+- **Trust:** Depends on clock sync quality (see ADR-001)
+- **Purpose:** Cross-process latency measurement
+
+### Monotonic Durations (`fhParseUs`, `fhSendUs`)
+
+- **Source:** FH `std::chrono::steady_clock`
+- **Trust:** Always trusted (immune to clock adjustments)
+- **Purpose:** FH segment latency measurement
 
 ## Latency Calculations
 
-With all timestamps in place, the following latencies can be computed:
+| Metric | Formula | Trust |
+|--------|---------|-------|
+| FH parse latency | `fhParseUs` | Always |
+| FH send latency | `fhSendUs` | Always |
+| FH → TP | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
+| TP → RDB | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
+| End-to-end | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` ms | Clock sync dependent |
+| Market → FH | `(fhRecvTimeUtcNs / 1e6) - exchEventTimeMs` ms | Indicative only |
 
-| Metric | Formula | Description |
-|--------|---------|-------------|
-| `fh_parse_us` | `fhParseUs` | FH parse/normalise duration (direct) |
-| `fh_send_us` | `fhSendUs` | FH send prep duration (direct) |
-| `fh_to_tp_ms` | `(tpRecvTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | FH to TP latency |
-| `tp_to_rdb_ms` | `(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) / 1e6` | TP to RDB latency |
-| `e2e_ms` | `(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) / 1e6` | End-to-end system latency |
+## Sequence Numbers
 
-## Notes
+`fhSeqNo` is a monotonically increasing counter per FH instance.
 
-- **Numeric types:**
-  - `price` and `qty` are stored as q `float` (64-bit floating point).
-  - Binance provides these fields as JSON strings; they are parsed and normalised to numeric values in the feed handler before publication.
+| Use Case | Method |
+|----------|--------|
+| Gap detection | Check for non-contiguous values |
+| Ordering | Secondary sort after `time` |
+| Replay validation | Verify completeness after recovery |
 
-- **Timing data:**
-  - Per-event latency fields are stored in this table to enable debugging and correlation.
-  - Aggregated telemetry (percentiles, rolling windows) is computed in the RDB and stored in separate telemetry tables (see ADR-005).
+**Note:** `fhSeqNo` resets to 1 on FH restart. Gaps indicate dropped messages.
 
-- **Keying:**
-  - The uniqueness key (`sym`, `tradeId`) supports deduplication during reconnect and replay scenarios.
+## Type Rationale
 
-- **Sequence numbers:**
-  - `fhSeqNo` is assigned by the feed handler and increments per published message.
-  - Gaps in `fhSeqNo` indicate dropped messages at the feed handler level.
-  - `fhSeqNo` resets to 0 on feed handler restart.
+| Field | Type | Rationale |
+|-------|------|-----------|
+| `price`, `qty` | float | 64-bit precision sufficient; matches kdb conventions |
+| `*Ms` fields | long | Milliseconds since epoch fit in 64-bit signed |
+| `*Ns` fields | long | Nanoseconds since epoch fit in 64-bit signed |
+| `*Us` fields | long | Microseconds; consistent integer type |
+| `fhSeqNo` | long | Allows >2B messages per session |
 
-- **Schema differences:**
-  - TP schema has 13 columns (excludes `rdbApplyTimeUtcNs`)
-  - RDB schema has 14 columns (includes `rdbApplyTimeUtcNs`)
-  - RDB appends `rdbApplyTimeUtcNs` when it receives data from TP
+## Design Decisions
 
-## Telemetry Tables
+### Per-Event Instrumentation
 
-See ADR-005 for telemetry table schemas. Summary:
+Unlike some architectures that emit timing data separately, this schema stores all instrumentation per-event. This enables:
+- Per-event latency debugging
+- Correlation without joins
+- Simplified telemetry aggregation
 
-| Table | Description |
-|-------|-------------|
-| `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) per 1-second bucket |
-| `telemetry_latency_e2e` | Cross-process latencies (p50/p95/p99) per 1-second bucket |
-| `telemetry_throughput` | Trade counts and volumes per 1-second bucket |
+Trade-off: Larger row size (~150 bytes vs ~80 bytes without instrumentation).
+
+### Telemetry Aggregation
+
+Per-event data is aggregated into telemetry tables (see ADR-005):
+- `telemetry_latency_fh` — FH segment percentiles
+- `telemetry_latency_e2e` — Cross-process latency percentiles  
+- `telemetry_throughput` — Trade counts and volumes
+
+This provides both granular debugging and efficient dashboarding.
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2025-12-17 | Initial 9-field schema |
+| 2.0 | 2025-12-18 | Extended to 14 fields with full instrumentation |
+
+## References
+
+- `adr-001-timestamps-and-latency-measurement.md` — Clock types, trust model
+- `adr-002-feed-handler-to-kdb-ingestion-path.md` — FH→TP data flow
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` — Aggregation strategy
+- `kdbx-real-time-architecture-measurement-notes.md` — Measurement implementation
