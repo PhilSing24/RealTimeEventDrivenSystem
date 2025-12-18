@@ -5,9 +5,9 @@ A real-time, event-driven market data pipeline built with **C++** and **kdb+/KDB
 ## What This Project Does
 
 ```
-Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──► RDB
-                                                │
-                                                └──► (RTE - future)
+Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──┬──► RDB (storage + telemetry)
+                                                         │
+                                                         └──► RTE (rolling analytics)
 ```
 
 - Ingests **real-time trade data** from Binance (BTCUSDT, ETHUSDT)
@@ -15,6 +15,7 @@ Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──► RDB
 - Publishes via **IPC** to a kdb+ tickerplant with pub/sub
 - Stores trades with **full instrumentation** (14 timestamp/latency fields)
 - Aggregates **telemetry metrics** (p50/p95/p99 latencies, throughput) every second
+- Computes **rolling analytics** (5-minute average price, trade count) tick-by-tick
 
 ## Quick Start
 
@@ -25,7 +26,10 @@ q kdb/tp.q
 # Terminal 2: Start RDB
 q kdb/rdb.q
 
-# Terminal 3: Build and run Feed Handler
+# Terminal 3: Start RTE
+q kdb/rte.q
+
+# Terminal 4: Build and run Feed Handler
 cmake -S . -B build
 cmake --build build
 ./build/binance_feed_handler
@@ -45,8 +49,17 @@ select sym, tradeId, fhParseUs, fhSendUs,
     tpToRdbMs:(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) % 1e6
     from -5#trade_binance
 
-/ View telemetry by symbol (after a few seconds)
+/ View telemetry (after a few seconds)
 select from telemetry_latency_e2e
+```
+
+In the RTE terminal (Terminal 3):
+
+```q
+/ View rolling analytics
+rollAnalytics
+
+/ isValid flips to 1b once window is 50% filled (~2.5 min)
 ```
 
 ## Configuration
@@ -63,7 +76,16 @@ const std::vector<std::string> SYMBOLS = {
 };
 ```
 
-Rebuild and restart the feed handler. No changes needed to TP or RDB.
+Rebuild and restart the feed handler. No changes needed to TP, RDB, or RTE.
+
+### RTE Parameters
+
+Edit the configuration section at the top of `kdb/rte.q`:
+
+```q
+.rte.cfg.windowNs:5 * 60 * 1000000000j;  / Rolling window: 5 minutes
+.rte.cfg.validityThreshold:0.5;          / 50% fill required for validity
+```
 
 ## Architecture
 
@@ -72,6 +94,17 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 | Feed Handler | — | C++ process: WebSocket → JSON parse → IPC publish |
 | Tickerplant | 5010 | Receives trades, timestamps, publishes to subscribers |
 | RDB | 5011 | Stores trades, computes telemetry aggregations |
+| RTE | 5012 | Computes rolling analytics (avgPrice, tradeCount) |
+
+### Data Flow
+
+```
+FH ──► TP ──┬──► RDB (storage)
+            │
+            └──► RTE (analytics)
+```
+
+RDB and RTE are **peer subscribers** to the tickerplant. Each receives every trade independently.
 
 ### Latency Measurement Points
 
@@ -83,13 +116,25 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 | `tpRecvTimeUtcNs` | TP | Wall-clock when TP receives message |
 | `rdbApplyTimeUtcNs` | RDB | Wall-clock when trade is query-consistent |
 
-### Telemetry Tables
+### Telemetry Tables (RDB)
 
 | Table | Contents |
 |-------|----------|
 | `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) by symbol |
 | `telemetry_latency_e2e` | Cross-process latencies (FH→TP→RDB) by symbol |
 | `telemetry_throughput` | Trade counts and volumes by symbol |
+
+### Rolling Analytics (RTE)
+
+| Field | Description |
+|-------|-------------|
+| `lastPrice` | Most recent trade price |
+| `avgPrice5m` | 5-minute rolling average price |
+| `tradeCount5m` | 5-minute rolling trade count |
+| `isValid` | True if window ≥50% filled |
+| `fillPct` | Percentage of window with data |
+| `windowStart` | Oldest trade time in window |
+| `updateTime` | Last analytics update time |
 
 ## Project Structure
 
@@ -101,7 +146,8 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 │   └── feed_handler.cpp          # C++ WebSocket client + IPC publisher
 ├── kdb/
 │   ├── tp.q                      # Tickerplant with pub/sub
-│   └── rdb.q                     # RDB with telemetry aggregation
+│   ├── rdb.q                     # RDB with telemetry aggregation
+│   └── rte.q                     # RTE with rolling analytics
 ├── third_party/
 │   └── kdb/
 │       ├── k.h                   # kdb+ C API header
@@ -128,7 +174,7 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 - **Documentation-first**: Architecture decisions documented before code
 - **Measurement discipline**: Latency captured at every stage with explicit trust model
 - **Event-driven**: Tick-by-tick processing, no batching
-- **Separation of concerns**: FH (ingestion) → TP (distribution) → RDB (storage/analytics)
+- **Separation of concerns**: FH (ingestion) → TP (distribution) → RDB (storage) / RTE (analytics)
 - **Ephemeral by design**: No persistence; focus on real-time behaviour
 
 ## Implementation Status
@@ -138,7 +184,7 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 | Feed Handler | ✓ Complete | Multi-symbol, config-driven, full instrumentation |
 | Tickerplant | ✓ Complete | Pub/sub, timestamp capture, subscriber management |
 | RDB | ✓ Complete | Subscription, timestamp capture, telemetry aggregation |
-| RTE | Planned | Rolling analytics (avgPrice, tradeCount) |
+| RTE | ✓ Complete | Rolling analytics (avgPrice, tradeCount), validity tracking |
 | Dashboards | Planned | KX Dashboards visualisation |
 
 ## Dependencies
@@ -166,7 +212,7 @@ Rebuild and restart the feed handler. No changes needed to TP or RDB.
 | FH parse | 10-50 µs |
 | FH send | 1-10 µs |
 | FH → TP | 0.1-0.5 ms |
-| TP → RDB | 0.01-0.1 ms |
+| TP → RDB | 0.1-0.3 ms |
 | **End-to-end** | **< 1 ms** |
 
 ## License
