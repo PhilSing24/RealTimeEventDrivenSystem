@@ -14,7 +14,7 @@
 / Telemetry bucket size
 .rdb.telemetryBucketMs:1000;
 
-/ Telemetry retention (15 minutes in nanoseconds)
+/ Telemetry retention (15 minutes)
 .rdb.telemetryRetentionNs:15 * 60 * 1000000000j;
 
 / -------------------------------------------------------
@@ -91,11 +91,11 @@ telemetry_throughput:([]
   .u.epochOffset + "j"$ts - 2000.01.01D0
   };
 
-/ Percentile function
-.rdb.percentile:{[p;x]
+/ Percentile function (takes percentile p and list x)
+.rdb.pctl:{[p;x]
   if[0 = n:count x; :0n];
-  x:(asc x) rank:("j"$p * n - 1) & n - 1;
-  x rank
+  idx:0 | ("j"$ p * n - 1) & n - 1;
+  (asc x) idx
   };
 
 / -------------------------------------------------------
@@ -139,55 +139,54 @@ telemetry_throughput:([]
   
   if[0 = count trades; .rdb.lastTelemetryBucket:bucket; :()];
   
-  / Compute FH latency aggregates by symbol
-  fhStats:select
-    parseUs_p50:.rdb.percentile[0.5; fhParseUs],
-    parseUs_p95:.rdb.percentile[0.95; fhParseUs],
-    parseUs_p99:.rdb.percentile[0.99; fhParseUs],
-    parseUs_max:max fhParseUs,
-    sendUs_p50:.rdb.percentile[0.5; fhSendUs],
-    sendUs_p95:.rdb.percentile[0.95; fhSendUs],
-    sendUs_p99:.rdb.percentile[0.99; fhSendUs],
-    sendUs_max:max fhSendUs,
-    cnt:count i
-    by sym from trades;
+  / Get unique symbols in this bucket
+  syms:exec distinct sym from trades;
   
-  fhStats:update bucket:bucket from fhStats;
-  `telemetry_latency_fh insert 0!fhStats;
+  / Compute FH latency stats per symbol
+  fhRows:{[bucket;trades;s]
+    t:select fhParseUs, fhSendUs from trades where sym = s;
+    parseVals:t[`fhParseUs];
+    sendVals:t[`fhSendUs];
+    n:count t;
+    `bucket`sym`parseUs_p50`parseUs_p95`parseUs_p99`parseUs_max`sendUs_p50`sendUs_p95`sendUs_p99`sendUs_max`cnt !
+      (bucket; s;
+       `float$.rdb.pctl[0.5; parseVals]; `float$.rdb.pctl[0.95; parseVals]; `float$.rdb.pctl[0.99; parseVals]; max parseVals;
+       `float$.rdb.pctl[0.5; sendVals]; `float$.rdb.pctl[0.95; sendVals]; `float$.rdb.pctl[0.99; sendVals]; max sendVals;
+       n)
+    }[bucket;trades] each syms;
   
-  / Compute E2E latency aggregates by symbol
-  / Calculate latencies in milliseconds
-  tradesWithLatency:update
-    fhToTpMs:(tpRecvTimeUtcNs - fhRecvTimeUtcNs) % 1e6,
-    tpToRdbMs:(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) % 1e6,
-    e2eMs:(rdbApplyTimeUtcNs - fhRecvTimeUtcNs) % 1e6
-    from trades;
+  `telemetry_latency_fh insert fhRows;
   
-  e2eStats:select
-    fhToTpMs_p50:.rdb.percentile[0.5; fhToTpMs],
-    fhToTpMs_p95:.rdb.percentile[0.95; fhToTpMs],
-    fhToTpMs_p99:.rdb.percentile[0.99; fhToTpMs],
-    tpToRdbMs_p50:.rdb.percentile[0.5; tpToRdbMs],
-    tpToRdbMs_p95:.rdb.percentile[0.95; tpToRdbMs],
-    tpToRdbMs_p99:.rdb.percentile[0.99; tpToRdbMs],
-    e2eMs_p50:.rdb.percentile[0.5; e2eMs],
-    e2eMs_p95:.rdb.percentile[0.95; e2eMs],
-    e2eMs_p99:.rdb.percentile[0.99; e2eMs],
-    cnt:count i
-    by sym from tradesWithLatency;
+  / Compute E2E latency stats per symbol
+  e2eRows:{[bucket;trades;s]
+    t:select fhRecvTimeUtcNs, tpRecvTimeUtcNs, rdbApplyTimeUtcNs from trades where sym = s;
+    fhRecv:t[`fhRecvTimeUtcNs];
+    tpRecv:t[`tpRecvTimeUtcNs];
+    rdbApply:t[`rdbApplyTimeUtcNs];
+    fhToTp:(tpRecv - fhRecv) % 1e6;
+    tpToRdb:(rdbApply - tpRecv) % 1e6;
+    e2e:(rdbApply - fhRecv) % 1e6;
+    n:count t;
+    `bucket`sym`fhToTpMs_p50`fhToTpMs_p95`fhToTpMs_p99`tpToRdbMs_p50`tpToRdbMs_p95`tpToRdbMs_p99`e2eMs_p50`e2eMs_p95`e2eMs_p99`cnt !
+      (bucket; s;
+       .rdb.pctl[0.5; fhToTp]; .rdb.pctl[0.95; fhToTp]; .rdb.pctl[0.99; fhToTp];
+       .rdb.pctl[0.5; tpToRdb]; .rdb.pctl[0.95; tpToRdb]; .rdb.pctl[0.99; tpToRdb];
+       .rdb.pctl[0.5; e2e]; .rdb.pctl[0.95; e2e]; .rdb.pctl[0.99; e2e];
+       n)
+    }[bucket;trades] each syms;
   
-  e2eStats:update bucket:bucket from e2eStats;
-  `telemetry_latency_e2e insert 0!e2eStats;
+  `telemetry_latency_e2e insert e2eRows;
   
-  / Compute throughput by symbol
-  tputStats:select
-    tradeCount:count i,
-    totalQty:sum qty,
-    totalValue:sum price * qty
-    by sym from trades;
+  / Compute throughput per symbol
+  tputRows:{[bucket;trades;s]
+    t:select price, qty from trades where sym = s;
+    prices:t[`price];
+    qtys:t[`qty];
+    `bucket`sym`tradeCount`totalQty`totalValue !
+      (bucket; s; count t; sum qtys; sum prices * qtys)
+    }[bucket;trades] each syms;
   
-  tputStats:update bucket:bucket from tputStats;
-  `telemetry_throughput insert 0!tputStats;
+  `telemetry_throughput insert tputRows;
   
   / Update last processed bucket
   .rdb.lastTelemetryBucket:bucket;

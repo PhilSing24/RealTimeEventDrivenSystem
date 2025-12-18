@@ -10,6 +10,7 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <vector>
 
 extern "C" {
 #include "k.h"
@@ -21,10 +22,36 @@ namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
+// ============================================================
+// CONFIGURATION
+// ============================================================
+// Add or remove symbols here. Lowercase required for Binance.
+const std::vector<std::string> SYMBOLS = {
+    "btcusdt",
+    "ethusdt"
+};
+
+// Epoch offset: nanoseconds between 1970.01.01 and 2000.01.01
+// kdb uses 2000.01.01 as epoch; Unix uses 1970.01.01
+const long long KDB_EPOCH_OFFSET_NS = 946684800000000000LL;
+// ============================================================
+
+// Build combined stream path: /stream?streams=btcusdt@trade/ethusdt@trade
+std::string buildStreamPath(const std::vector<std::string>& symbols) {
+    std::string path = "/stream?streams=";
+    for (size_t i = 0; i < symbols.size(); ++i) {
+        if (i > 0) path += "/";
+        path += symbols[i] + "@trade";
+    }
+    return path;
+}
+
 int run_feed_handler() {
     const std::string host = "stream.binance.com";
     const std::string port = "9443";
-    const std::string target = "/ws/btcusdt@trade";
+    const std::string target = buildStreamPath(SYMBOLS);
+
+    std::cout << "Subscribing to streams: " << target << "\n";
 
     net::io_context ioc;
     ssl::context ctx{ssl::context::tlsv12_client};
@@ -38,7 +65,8 @@ int run_feed_handler() {
     ws.next_layer().handshake(ssl::stream_base::client);
     ws.handshake(host, target);
 
-    std::cout << "Connected to Binance trade stream\n";
+    std::cout << "Connected to Binance combined trade stream (" 
+              << SYMBOLS.size() << " symbols)\n";
 
     // ---- Connect to tickerplant ----
     int tp = khpu((S)"localhost", 5010, (S)"");
@@ -65,10 +93,15 @@ int run_feed_handler() {
 
         std::string msg = beast::buffers_to_string(buffer.data());
 
-        rapidjson::Document d;
-        d.Parse(msg.c_str());
-        if (!d.IsObject()) continue;
+        rapidjson::Document doc;
+        doc.Parse(msg.c_str());
+        if (!doc.IsObject()) continue;
 
+        // Combined stream wraps payload: {"stream":"btcusdt@trade","data":{...}}
+        if (!doc.HasMember("data")) continue;
+        const rapidjson::Value& d = doc["data"];
+
+        if (!d.IsObject()) continue;
         if (!d.HasMember("s")) continue;
 
         const char* sym = d["s"].GetString();
@@ -89,8 +122,10 @@ int run_feed_handler() {
 
         // ---- Build kdb row (this is "send preparation") ----
         // Row ordered to match table schema in tp.q
+        // Note: ktj(-KP, ...) expects nanoseconds since kdb epoch (2000.01.01)
+        //       fhRecvTimeUtcNs is Unix epoch, so we subtract the offset
         K row = knk(12,
-            ktj(-KP, fhRecvTimeUtcNs),       // time (placeholder; TP may overwrite)
+            ktj(-KP, fhRecvTimeUtcNs - KDB_EPOCH_OFFSET_NS),  // time (kdb epoch)
             ks((S)sym),                       // sym
             kj(tradeId),                      // tradeId
             kf(price),                        // price
@@ -98,7 +133,7 @@ int run_feed_handler() {
             kb(buyerIsMaker),                 // buyerIsMaker
             kj(exchEventTimeMs),              // exchEventTimeMs
             kj(exchTradeTimeMs),              // exchTradeTimeMs
-            kj(fhRecvTimeUtcNs),              // fhRecvTimeUtcNs
+            kj(fhRecvTimeUtcNs),              // fhRecvTimeUtcNs (Unix epoch - raw)
             kj(fhParseUs),                    // fhParseUs
             kj(0LL),                          // fhSendUs (placeholder)
             kj(fhSeqNo)                       // fhSeqNo
@@ -128,5 +163,3 @@ int run_feed_handler() {
 
     return 0;
 }
-
-
