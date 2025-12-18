@@ -59,3 +59,13 @@ core.*
 secrets/
 config.local.*
 config.private.*
+
+# -----------------------------
+# Python
+# -----------------------------
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+pip-log.txt
