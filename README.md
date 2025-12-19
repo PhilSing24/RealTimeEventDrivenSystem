@@ -1,6 +1,8 @@
 # Real-Time Event-Driven Market Data System
 
-A real-time, event-driven market data pipeline built with **C++** and **kdb+/KDB-X**, inspired by production architectures used in tier-1 financial institutions.
+This repository contains an exploratory implementation of a real-time, event-driven Binance trades pipeline built with C++ and kdb+/KDB-X. The project is inspired by the article Building Real-Time Event-Driven KDB-X Systems.
+
+The original article has been carefully rewritten and restructured to be LLM-friendly, while (hopefully) preserving the depth, precision, and engineering intent of the source material. The rewritten version kdbx-real-time-architecture-reference is available as a Markdown document in the docs/ directory, alongside a set of Architecture Decision Records (ADRs) in the docs/decisions. Together, these documents serve as both a technical reference and a companion to the implementation in this repository.
 
 ## What This Project Does
 
