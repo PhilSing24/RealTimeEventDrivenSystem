@@ -1,10 +1,10 @@
 # ADR-007: Visualisation and Consumption Strategy
 
 ## Status
-Accepted
+Accepted (Updated 2025-12-19)
 
 ## Date
-2025-12-17
+2025-12-17 (Updated 2025-12-19)
 
 ## Context
 
@@ -37,6 +37,7 @@ A decision is required on how system outputs are visualised and consumed.
 | IPC | Inter-Process Communication |
 | RDB | Real-Time Database |
 | RTE | Real-Time Engine |
+| TEL | Telemetry Process |
 | TP | Tickerplant |
 
 ## Decision
@@ -77,39 +78,37 @@ Polling is appropriate because:
 |-----------|-----------|
 | 200ms | Minimum for human perception; highest load |
 | 500ms | Good responsiveness; moderate load |
-| **1 second** | **Balanced; aligns with telemetry buckets (ADR-005)** |
+| **1 second** | **Balanced; acceptable responsiveness** |
 | 5 seconds | Low load; sluggish feel |
 
 Rationale:
-- Matches ADR-005 telemetry bucket granularity (1 second)
-- Each poll retrieves fresh telemetry data
 - Acceptable responsiveness for development use
-- Minimal query load on RDB/RTE
+- Minimal query load on RDB/RTE/TEL
+- Note: TEL buckets are 5 seconds, so telemetry data updates every 5s regardless
 
 ### Query Targets
 
-Dashboards query **both RDB and RTE**:
+Dashboards query **RDB, RTE, and TEL**:
+
 ```
-┌─────────────┐
-│  Dashboard  │
-└──────┬──────┘
-       │
-       ├────► RDB (raw trades, telemetry tables)
-       │
-       └────► RTE (rolling analytics, validity flags)
+              +---> RDB :5011 (raw trades)
+              |
+Dashboard ----+---> RTE :5012 (rolling analytics)
+              |
+              +---> TEL :5013 (telemetry)
 ```
 
-| Data | Source | Table/Query |
-|------|--------|-------------|
-| Last trade price | RDB | `trade_binance` |
-| Raw trade history | RDB | `trade_binance` |
-| FH latency metrics | RDB | `telemetry_latency_fh` |
-| E2E latency metrics | RDB | `telemetry_latency_e2e` |
-| Throughput metrics | RDB | `telemetry_throughput` |
-| System health | RDB | `telemetry_health` |
-| Rolling average price | RTE | `rollAnalytics` |
-| Rolling trade count | RTE | `rollAnalytics` |
-| Analytics validity | RTE | `rollAnalytics` |
+| Data | Source | Port | Table/Query |
+|------|--------|------|-------------|
+| Last trade price | RDB | 5011 | `trade_binance` |
+| Raw trade history | RDB | 5011 | `trade_binance` |
+| Rolling average price | RTE | 5012 | `rollAnalytics` |
+| Rolling trade count | RTE | 5012 | `rollAnalytics` |
+| Analytics validity | RTE | 5012 | `rollAnalytics` |
+| FH latency metrics | TEL | 5013 | `telemetry_latency_fh` |
+| E2E latency metrics | TEL | 5013 | `telemetry_latency_e2e` |
+| Throughput metrics | TEL | 5013 | `telemetry_throughput` |
+| Analytics health | TEL | 5013 | `telemetry_analytics_health` |
 
 **Trade-off acknowledged:** The reference architecture recommends:
 > "Processes accessed by users should be isolated from those performing core system calculations to improve stability and resource control."
@@ -125,8 +124,8 @@ Three dashboards are defined:
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
 | Last Price | RDB | Most recent trade price per symbol | 1 sec |
-| Rolling Avg Price | RTE | `avgPrice` from `rollAnalytics` | 1 sec |
-| Trade Count | RTE | `tradeCount` from `rollAnalytics` | 1 sec |
+| Rolling Avg Price | RTE | `avgPrice5m` from `rollAnalytics` | 1 sec |
+| Trade Count | RTE | `tradeCount5m` from `rollAnalytics` | 1 sec |
 | Price Chart | RDB | Time series of recent prices (last 5 min) | 1 sec |
 | Validity Indicator | RTE | `isValid`, `fillPct` display | 1 sec |
 
@@ -134,17 +133,17 @@ Three dashboards are defined:
 
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
-| FH Parse Latency | RDB | p50/p95/p99 from `telemetry_latency_fh` | 1 sec |
-| FH Send Latency | RDB | p50/p95/p99 from `telemetry_latency_fh` | 1 sec |
-| E2E Latency | RDB | p50/p95/p99 from `telemetry_latency_e2e` | 1 sec |
-| Latency Time Series | RDB | Rolling chart of percentiles (last 5 min) | 1 sec |
-| Throughput Chart | RDB | Events/sec from `telemetry_throughput` | 1 sec |
+| FH Parse Latency | TEL | p50/p95/max from `telemetry_latency_fh` | 1 sec |
+| FH Send Latency | TEL | p50/p95/max from `telemetry_latency_fh` | 1 sec |
+| E2E Latency | TEL | p50/p95/max from `telemetry_latency_e2e` | 1 sec |
+| Latency Time Series | TEL | Rolling chart of percentiles (last 5 min) | 1 sec |
+| Throughput Chart | TEL | Events/sec from `telemetry_throughput` | 1 sec |
 
 **Dashboard 3: System Health**
 
 | Panel | Data Source | Content | Update |
 |-------|-------------|---------|--------|
-| Component Status | RDB | Status from `telemetry_health` | 1 sec |
+| Analytics Health | TEL | Status from `telemetry_analytics_health` | 1 sec |
 | Last Update Time | RDB/RTE | Freshness indicator per component | 1 sec |
 | Data Freshness | RDB | Time since last trade per symbol | 1 sec |
 | Gap Indicator | RDB | Detected `fhSeqNo` gaps (if any) | 1 sec |
@@ -170,12 +169,13 @@ Additionally:
 |--------|--------|---------------------------|
 | Last price | RDB | < 2 seconds |
 | Rolling avg | RTE | < 2 seconds |
-| Telemetry | RDB | < 2 seconds |
+| Telemetry | TEL | < 7 seconds (5s bucket + 2s query) |
 
 These targets are achievable with 1-second polling and account for:
 - Poll interval (up to 1 second)
 - Query execution time (< 100ms expected)
 - Rendering time (< 100ms expected)
+- TEL bucket delay (5 seconds for telemetry data)
 
 The reference architecture notes:
 > "A minimum update interval of approximately 200 milliseconds is generally sufficient, as this aligns with the threshold at which the human eye can perceive simple visual changes."
@@ -191,14 +191,14 @@ The reference architecture describes a UI caching pattern for scale:
 
 For this project:
 - Single user (developer) assumed
-- Direct RDB/RTE queries acceptable
+- Direct RDB/RTE/TEL queries acceptable
 - No UI cache implemented
 - No gateway process implemented
 
 If multiple users or higher query rates are needed:
 - Introduce UI cache process
 - Cache pre-computes common queries
-- Dashboards query cache instead of RDB/RTE
+- Dashboards query cache instead of RDB/RTE/TEL
 
 ### Intended Usage
 
@@ -225,11 +225,11 @@ Each symbol has dedicated panels or can be filtered via dashboard controls.
 
 KX Dashboards with polling was selected because:
 
-- **Native integration** — No additional tooling or infrastructure required
-- **Rapid development** — Pre-built components for time-series visualisation
-- **Sufficient for purpose** — Human-scale observation doesn't require streaming
-- **Alignment with project goals** — Exploratory, not production-grade
-- **Consistency** — Data stays within KDB-X ecosystem
+- **Native integration** - No additional tooling or infrastructure required
+- **Rapid development** - Pre-built components for time-series visualisation
+- **Sufficient for purpose** - Human-scale observation doesn't require streaming
+- **Alignment with project goals** - Exploratory, not production-grade
+- **Consistency** - Data stays within KDB-X ecosystem
 
 ## Alternatives Considered
 
@@ -272,24 +272,23 @@ May be introduced if user count grows.
 ### 6. Faster polling (200ms)
 Rejected:
 - Higher query load
-- Misaligned with 1-second telemetry buckets
 - No perceptible benefit for human observation
+- TEL data only updates every 5 seconds anyway
 
 ### 7. Slower polling (5 seconds)
 Rejected:
 - Sluggish feel during development
 - Delays in observing system behaviour
-- 1-second provides better responsiveness
+- 1-second provides better responsiveness for RDB/RTE data
 
 ## Consequences
 
 ### Positive
 
 - Rapid feedback during development
-- Clear visibility into both raw and derived data
-- Tight integration with kdb analytics
+- Clear visibility into raw data (RDB), analytics (RTE), and telemetry (TEL)
+- Tight integration with kdb ecosystem
 - Minimal infrastructure requirements
-- Aligned with telemetry bucket granularity
 - Validity indicators aid interpretation
 - Simple polling model easy to debug
 
@@ -298,9 +297,9 @@ Rejected:
 - Polling introduces redundant queries (even when data unchanged)
 - Dashboards not optimised for large user populations
 - Fine-grained UI customisation is limited
-- Direct RDB/RTE queries mix user and system load
+- Direct queries mix user and system load
 - No alerting capability (human must observe)
-- 1-second latency may feel slow for some use cases
+- Telemetry has 5-second delay due to bucket size
 
 These trade-offs are acceptable for the current phase.
 
@@ -322,5 +321,5 @@ These trade-offs are acceptable for the current phase.
 - `../kdbx-real-time-architecture-measurement-notes.md`
 - `adr-001-timestamps-and-latency-measurement.md` (latency metrics definitions)
 - `adr-004-real-time-rolling-analytics-computation.md` (RTE analytics, validity flags)
-- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (telemetry tables, bucket alignment)
+- `adr-005-telemetry-and-metrics-aggregation-strategy.md` (TEL tables, bucket alignment)
 - `adr-006-recovery-and-replay-strategy.md` (gap detection display)

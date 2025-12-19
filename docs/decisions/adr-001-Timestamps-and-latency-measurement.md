@@ -154,7 +154,6 @@ Latency SLOs are expressed using percentiles over rolling windows.
 |------------|---------|
 | p50 | Typical latency (median) |
 | p95 | Majority-case tail |
-| p99 | Operationally significant tail |
 
 **Rolling windows:**
 

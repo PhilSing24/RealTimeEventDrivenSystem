@@ -24,6 +24,7 @@
  * @see docs/decisions/adr-001-Timestamps-and-latency-measurement.md
  * @see docs/decisions/adr-002-Feed-handler-to-kdb-ingestion-path.md
  * @see docs/specs/trades-schema.md
+ * @see https://code.kx.com/q/wp/capi/ (kdb+ C API reference)
  */
 
 #include <boost/beast/core.hpp>        // Buffer handling
@@ -139,7 +140,7 @@ int run_feed_handler() {
     // ---- Connect to kdb+ tickerplant ----
     // khpu: connect with host, port, credentials (empty = no auth)
     // Returns handle > 0 on success, < 0 on failure
-    int tp = khpu((S)"localhost", 5010, (S)"");
+    int tp = khpu((S)"localhost", 5010, (S)""); // Open socket to TP
     if (tp < 0) {
         std::cerr << "Failed to connect to tickerplant on port 5010\n";
         return 1;
@@ -163,8 +164,8 @@ int run_feed_handler() {
         // system_clock provides wall-clock time (subject to NTP adjustments)
         auto recvWall = std::chrono::system_clock::now();
         long long fhRecvTimeUtcNs =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                recvWall.time_since_epoch()).count();
+            std::chrono::duration_cast<std::chrono::nanoseconds>(   // Convert to nanoseconds
+                recvWall.time_since_epoch()).count(); // Duration since Unix epoch (1970-01-01)
 
         // ---- Start monotonic timer for parse latency ----
         // steady_clock is monotonic (never goes backwards)
@@ -213,7 +214,7 @@ int run_feed_handler() {
         // kf: create float
         // kb: create boolean
         K row = knk(12,
-            ktj(-KP, fhRecvTimeUtcNs - KDB_EPOCH_OFFSET_NS),  // time (kdb epoch)
+            ktj(-KP, fhRecvTimeUtcNs - KDB_EPOCH_OFFSET_NS),  // ns since 01.01.2000 (kdb epoch). -KP cause it's an atom
             ks((S)sym),                       // sym
             kj(tradeId),                      // tradeId
             kf(price),                        // price

@@ -1,23 +1,36 @@
 # Real-Time Event-Driven Market Data System
 
-This repository contains an exploratory implementation of a real-time, event-driven Binance trades pipeline built with C++ and kdb+/KDB-X. The project is inspired by the article Building Real-Time Event-Driven KDB-X Systems.
+A real-time, event-driven Binance trades pipeline built with C++ and kdb+/KDB-X. Inspired by the article *Building Real-Time Event-Driven KDB-X Systems* by Data Intellect.
 
 The original article has been carefully rewritten and restructured to be LLM-friendly, while (hopefully) preserving the depth, precision, and engineering intent of the source material. The rewritten version kdbx-real-time-architecture-reference is available as a Markdown document in the docs/ directory, alongside a set of Architecture Decision Records (ADRs) in the docs/decisions. Together, these documents serve as both a technical reference and a companion to the implementation in this repository.
 
-## What This Project Does
+
+## Architecture
 
 ```
-Binance WebSocket ──► C++ Feed Handler ──► Tickerplant ──┬──► RDB (storage + telemetry)
-                                                         │
-                                                         └──► RTE (rolling analytics)
+Binance WebSocket --> C++ Feed Handler --> TP:5010 --+--> RDB:5011 (storage)
+                                                     |
+                                                     +--> RTE:5012 (analytics)
+
+                                          TEL:5013 <---- queries RDB + RTE
 ```
+
+| Component | Port | Role |
+|-----------|------|------|
+| TP | 5010 | Tickerplant - pub/sub distribution |
+| RDB | 5011 | Real-Time Database - storage only |
+| RTE | 5012 | Real-Time Engine - rolling analytics |
+| TEL | 5013 | Telemetry - aggregates latency/throughput metrics |
+| FH | - | Feed Handler - WebSocket to IPC |
+
+## What This Project Does
 
 - Ingests **real-time trade data** from Binance (BTCUSDT, ETHUSDT)
 - Captures **latency measurements** at every pipeline stage
 - Publishes via **IPC** to a kdb+ tickerplant with pub/sub
 - Stores trades with **full instrumentation** (14 timestamp/latency fields)
-- Aggregates **telemetry metrics** (p50/p95/p99 latencies, throughput) every second
-- Computes **rolling analytics** (5-minute average price, trade count) tick-by-tick
+- Computes **rolling analytics** (5-minute average price, trade count)
+- Aggregates **telemetry metrics** (p50/p95/max latencies, throughput) every 5 seconds
 
 ## Quick Start
 
@@ -31,37 +44,40 @@ q kdb/rdb.q
 # Terminal 3: Start RTE
 q kdb/rte.q
 
-# Terminal 4: Build and run Feed Handler
+# Terminal 4: Start TEL
+q kdb/tel.q
+
+# Terminal 5: Build and run Feed Handler
 cmake -S . -B build
 cmake --build build
 ./build/binance_feed_handler
 ```
 
-## Verify It Works
-
-In the RDB terminal (Terminal 2):
-
-```q
-/ Check data is flowing (both symbols)
-select count i by sym from trade_binance
-
-/ View recent trades with latencies
-select sym, tradeId, fhParseUs, fhSendUs, 
-    fhToTpMs:(tpRecvTimeUtcNs - fhRecvTimeUtcNs) % 1e6,
-    tpToRdbMs:(rdbApplyTimeUtcNs - tpRecvTimeUtcNs) % 1e6
-    from -5#trade_binance
-
-/ View telemetry (after a few seconds)
-select from telemetry_latency_e2e
+Or use the tmux launcher:
+```bash
+./start.sh
 ```
 
-In the RTE terminal (Terminal 3):
+## Verify It Works
 
+**RDB (port 5011)** - raw trades:
 ```q
-/ View rolling analytics
-rollAnalytics
+select count i by sym from trade_binance
+select from -5#trade_binance
+```
 
+**RTE (port 5012)** - rolling analytics:
+```q
+rollAnalytics
 / isValid flips to 1b once window is 50% filled (~2.5 min)
+```
+
+**TEL (port 5013)** - telemetry:
+```q
+select from telemetry_latency_e2e where bucket = max bucket
+select from telemetry_latency_fh where bucket = max bucket
+select from telemetry_throughput where bucket = max bucket
+select from telemetry_analytics_health where bucket = max bucket
 ```
 
 ## Configuration
@@ -78,7 +94,7 @@ const std::vector<std::string> SYMBOLS = {
 };
 ```
 
-Rebuild and restart the feed handler. No changes needed to TP, RDB, or RTE.
+Rebuild and restart the feed handler. No changes needed to kdb+ components.
 
 ### RTE Parameters
 
@@ -89,26 +105,28 @@ Edit the configuration section at the top of `kdb/rte.q`:
 .rte.cfg.validityThreshold:0.5;          / 50% fill required for validity
 ```
 
-## Architecture
+### TEL Parameters
 
-| Component | Port | Description |
-|-----------|------|-------------|
-| Feed Handler | — | C++ process: WebSocket → JSON parse → IPC publish |
-| Tickerplant | 5010 | Receives trades, timestamps, publishes to subscribers |
-| RDB | 5011 | Stores trades, computes telemetry aggregations |
-| RTE | 5012 | Computes rolling analytics (avgPrice, tradeCount) |
+Edit the configuration section at the top of `kdb/tel.q`:
 
-### Data Flow
-
-```
-FH ──► TP ──┬──► RDB (storage)
-            │
-            └──► RTE (analytics)
+```q
+.tel.cfg.bucketSec:5;        / Telemetry bucket size
+.tel.cfg.retentionMin:15;    / Retention period
 ```
 
-RDB and RTE are **peer subscribers** to the tickerplant. Each receives every trade independently.
+## Data Flow
 
-### Latency Measurement Points
+```
+FH --> TP --+--> RDB (storage)
+            |
+            +--> RTE (analytics)
+
+TEL <-- queries both on timer
+```
+
+RDB and RTE are **peer subscribers** to the tickerplant. Each receives every trade independently. TEL queries both to aggregate metrics.
+
+## Latency Measurement Points
 
 | Field | Source | Description |
 |-------|--------|-------------|
@@ -118,22 +136,23 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 | `tpRecvTimeUtcNs` | TP | Wall-clock when TP receives message |
 | `rdbApplyTimeUtcNs` | RDB | Wall-clock when trade is query-consistent |
 
-### Telemetry Tables (RDB)
+## Telemetry Tables (TEL)
 
 | Table | Contents |
 |-------|----------|
-| `telemetry_latency_fh` | FH segment latencies (p50/p95/p99/max) by symbol |
-| `telemetry_latency_e2e` | Cross-process latencies (FH→TP→RDB) by symbol |
+| `telemetry_latency_fh` | FH segment latencies (p50/p95/max) by symbol |
+| `telemetry_latency_e2e` | Cross-process latencies (FH->TP->RDB) by symbol |
 | `telemetry_throughput` | Trade counts and volumes by symbol |
+| `telemetry_analytics_health` | RTE validity status by symbol |
 
-### Rolling Analytics (RTE)
+## Rolling Analytics (RTE)
 
 | Field | Description |
 |-------|-------------|
 | `lastPrice` | Most recent trade price |
 | `avgPrice5m` | 5-minute rolling average price |
 | `tradeCount5m` | 5-minute rolling trade count |
-| `isValid` | True if window ≥50% filled |
+| `isValid` | True if window >= 50% filled |
 | `fillPct` | Percentage of window with data |
 | `windowStart` | Oldest trade time in window |
 | `updateTime` | Last analytics update time |
@@ -148,12 +167,15 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 │   └── feed_handler.cpp          # C++ WebSocket client + IPC publisher
 ├── kdb/
 │   ├── tp.q                      # Tickerplant with pub/sub
-│   ├── rdb.q                     # RDB with telemetry aggregation
-│   └── rte.q                     # RTE with rolling analytics
+│   ├── rdb.q                     # RDB - storage only
+│   ├── rte.q                     # RTE - rolling analytics
+│   └── tel.q                     # TEL - telemetry aggregation
 ├── third_party/
 │   └── kdb/
 │       ├── k.h                   # kdb+ C API header
 │       └── c.o                   # kdb+ C API library
+├── start.sh                      # tmux launcher
+├── stop.sh                       # Stop all processes
 └── docs/
     ├── README.md
     ├── kdbx-real-time-architecture-reference.md
@@ -168,7 +190,8 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
         ├── adr-004-real-time-rolling-analytics-computation.md
         ├── adr-005-telemetry-and-metrics-aggregation-strategy.md
         ├── adr-006-recovery-and-replay-strategy.md
-        └── adr-007-visualisation-and-consumption-strategy.md
+        ├── adr-007-visualisation-and-consumption-strategy.md
+        └── adr-008-error-handling-strategy.md
 ```
 
 ## Design Principles
@@ -176,18 +199,20 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 - **Documentation-first**: Architecture decisions documented before code
 - **Measurement discipline**: Latency captured at every stage with explicit trust model
 - **Event-driven**: Tick-by-tick processing, no batching
-- **Separation of concerns**: FH (ingestion) → TP (distribution) → RDB (storage) / RTE (analytics)
+- **Separation of concerns**: Storage (RDB), Analytics (RTE), Telemetry (TEL)
 - **Ephemeral by design**: No persistence; focus on real-time behaviour
 
 ## Implementation Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Feed Handler | ✓ Complete | Multi-symbol, config-driven, full instrumentation |
-| Tickerplant | ✓ Complete | Pub/sub, timestamp capture, subscriber management |
-| RDB | ✓ Complete | Subscription, timestamp capture, telemetry aggregation |
-| RTE | ✓ Complete | Rolling analytics (avgPrice, tradeCount), validity tracking |
+| Feed Handler | Complete | Multi-symbol, full instrumentation |
+| Tickerplant | Complete | Pub/sub, timestamp capture |
+| RDB | Complete | Storage only (telemetry moved to TEL) |
+| RTE | Complete | Rolling analytics, validity tracking |
+| TEL | Complete | Queries RDB+RTE, aggregates metrics |
 | Dashboards | Planned | KX Dashboards visualisation |
+
 
 ## Dependencies
 
@@ -197,6 +222,7 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 - **OpenSSL**
 - **RapidJSON**
 - **kdb+** 4.x (with valid license)
+- **tmux** (optional, for start.sh)
 
 ## Documentation
 
@@ -206,16 +232,6 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 | [Measurement Notes](docs/kdbx-real-time-architecture-measurement-notes.md) | Latency measurement definitions and trust model |
 | [Trades Schema](docs/specs/trades-schema.md) | Canonical schema with all 14 fields |
 | [ADRs](docs/decisions/) | Architecture Decision Records |
-
-## Typical Latencies (Single Host)
-
-| Segment | Typical p99 |
-|---------|-------------|
-| FH parse | 10-50 µs |
-| FH send | 1-10 µs |
-| FH → TP | 0.1-0.5 ms |
-| TP → RDB | 0.1-0.3 ms |
-| **End-to-end** | **< 1 ms** |
 
 ## License
 
