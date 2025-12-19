@@ -7,12 +7,14 @@ The original article has been carefully rewritten and restructured to be LLM-fri
 
 ## Architecture
 
-```
-Binance WebSocket --> C++ Feed Handler --> TP:5010 --+--> RDB:5011 (storage)
-                                                     |
-                                                     +--> RTE:5012 (analytics)
-
-                                          TEL:5013 <---- queries RDB + RTE
+```mermaid
+flowchart LR
+    B[Binance] --> FH[Feed Handler]
+    FH --> TP[TP :5010]
+    TP --> RDB[RDB :5011storage]
+    TP --> RTE[RTE :5012analytics]
+    TEL[TEL :5013telemetry] -.->|queries| RDB
+    TEL -.->|queries| RTE
 ```
 
 | Component | Port | Role |
