@@ -1,10 +1,10 @@
 # ADR-003: Tickerplant Logging and Durability Strategy
 
 ## Status
-Accepted
+Accepted (Updated 2025-12-24)
 
 ## Date
-2025-12-17
+2025-12-17 (Updated 2025-12-24)
 
 ## Context
 
@@ -35,165 +35,181 @@ This decision affects recovery semantics, operational complexity, latency, and a
 
 ## Decision
 
-The tickerplant will initially operate **without persistent logging**.
+The tickerplant implements **optional persistent logging**, disabled by default.
 
-### Architecture Variant
+### Update (2025-12-24)
 
-This follows the **Non-Logging Tickerplant** pattern described in the reference architecture:
+TP logging has been implemented to support:
+- Performance testing via log replay
+- Development and debugging workflows
+- Future recovery capabilities
 
-> "An alternative architecture is to decouple data distribution from data persistence by splitting the responsibilities of the tickerplant. In this variant: The tickerplant is responsible only for distributing data."
+### Architecture
 
-In this project:
-- The tickerplant is responsible only for distributing data
-- No separate logging process is implemented
-- Data persistence is not provided at any layer
+The tickerplant now supports both modes:
+- **Logging disabled** (default): Pure distribution, no disk I/O
+- **Logging enabled**: Writes to `logs/` directory with daily rotation
 
-### Logging Configuration
+### Configuration
 
-- The tickerplant will not write update logs to disk.
-- Data durability is not guaranteed across process restarts.
-- Recovery relies on upstream replay (Binance reconnect / resubscribe).
-- Logging may be introduced later without changing the feed handler contract.
+```q
+.tp.cfg.logEnabled:1b;          / Enable/disable logging
+.tp.cfg.logDir:"logs";          / Log directory
+```
+
+### Log Format
+
+- One file per day: `logs/YYYY.MM.DD.log`
+- Binary IPC format (serialized q objects)
+- Each message: `(`.u.upd; tablename; rowdata)`
+- Fixed message size: 145 bytes per trade
+
+### Logging Implementation
+
+```q
+.tp.log:{[tbl;data]
+  if[not .tp.cfg.logEnabled; :()];
+  .tp.logHandle enlist (`.u.upd; tbl; data);
+  };
+```
+
+Key characteristics:
+- Async append (non-blocking)
+- No compression
+- Daily rotation via `.tp.rotate[]`
 
 ### End-of-Day Behaviour
 
-- No Historical Database (HDB) is implemented
-- All data is ephemeral and lost on process restart or end of day
-- No end-of-day rollover or persistence occurs
-- This aligns with the project's focus on real-time behaviour, not historical analysis
+- Log files rotate at midnight or on manual `.tp.rotate[]` call
+- Old logs retained for replay/debugging
+- No Historical Database (HDB) - logs are for replay, not query
 
 ### Downstream Recovery Implications
 
-Without tickerplant logging, downstream components cannot recover historical state:
+With logging enabled, downstream components can recover via replay:
 
-| Component | On Restart | Consequence |
-|-----------|------------|-------------|
-| TP | Restarts empty | RDB/RTE must resubscribe; data gap from restart point |
-| RDB | Starts empty | Only receives data from restart time onwards |
-| RTE | State lost | Rolling analytics invalid until window refills (see ADR-004) |
+| Component | On Restart | Recovery Method |
+|-----------|------------|-----------------|
+| TP | Restarts empty | N/A (stateless) |
+| RDB | Starts empty | Replay from TP log |
+| RTE | State lost | Replay from TP log |
 
-This is acceptable because:
-- The project is exploratory and does not require session continuity
-- Binance data has no regulatory retention requirements in this context
-- Analytics validity is observable via dashboards (ADR-007)
-
-### Telemetry Data Persistence
-
-Telemetry data (e.g., `telemetry_latency_fh` defined in ADR-001) is also ephemeral:
-- Stored in-memory only
-- Lost on process restart
-- Sufficient for real-time observation and debugging
-- Historical telemetry analysis is out of scope
+Recovery via replay is now supported (see ADR-006).
 
 ### System-Wide Durability Stance
 
-Combined with ADR-002 (async IPC, no local buffering), the entire pipeline is ephemeral:
+| Mode | Data Recovery |
+|------|---------------|
+| Logging disabled | No recovery; data lost on any failure |
+| Logging enabled | Replay possible from log files |
 
-| Failure Scenario | Data Recovery |
-|------------------|---------------|
-| FH loses connection to TP | Messages dropped; not recoverable |
-| TP loses connection to RDB | Messages dropped; not recoverable |
-| Any component restarts | State lost; resumes from live stream only |
+### Performance Impact
 
-This is an explicit, system-wide design choice for the current phase.
+Logging adds minimal overhead:
+- Async file I/O (non-blocking)
+- ~145 bytes per trade
+- No measurable latency impact at current message rates
 
 ## Rationale
 
-This option was selected because it:
+Logging was implemented because:
 
-- Keeps the initial system simple and focused.
-- Minimises operational overhead during early development.
-- Avoids premature optimisation for durability in an exploratory project.
-- Aligns with the fact that Binance market data can be re-subscribed after reconnect.
-- Preserves low latency by avoiding synchronous disk I/O in the critical path.
+- Enables performance testing via replay (447K msg/s measured)
+- Supports development and debugging workflows
+- Provides foundation for future recovery capabilities
+- Minimal complexity (optional, disabled by default)
+- No significant latency impact
 
-### Latency Benefit
+### Latency Considerations
 
-Disabling logging provides measurable latency advantages:
-- No synchronous disk I/O in the tickerplant critical path
-- Lower and more predictable publish latency to downstream subscribers
-- Cleaner latency measurements without I/O variance
-- Aligns with the "hot path" optimisation pattern from the reference architecture
+With logging disabled:
+- No disk I/O in critical path
+- Lowest possible latency
+
+With logging enabled:
+- Async writes minimize impact
+- Suitable for development/testing
+- Production deployments can disable if latency-critical
 
 ## Alternatives Considered
 
-### 1. Durable Tickerplant (Logging Enabled)
-Rejected initially because:
-- Introduces additional complexity (log rotation, replay tooling).
-- Adds I/O overhead that complicates latency analysis.
-- Is not required for validating architecture patterns or latency measurement.
+### 1. No logging at all
+Originally selected, later revised:
+- Prevented replay-based testing
+- Made debugging difficult
+- Limited future recovery options
 
-This option remains viable for a later phase.
-
-### 2. Logging in the Feed Handler
-Rejected because:
-- Duplicates tickerplant responsibilities.
-- Complicates recovery semantics.
-- Violates separation of concerns.
+### 2. Synchronous logging
+Rejected:
+- Adds latency to critical path
+- Blocks on disk I/O
+- Not necessary for exploratory project
 
 ### 3. Separate Logger Process
-Rejected because:
-- Adds architectural complexity without benefit at this stage.
-- Introduces coordination challenges between logger and TP.
-- Overkill for exploratory project.
-
-### 4. External Persistence Layer
-Out of scope for this project:
-- Adds infrastructure complexity.
-- Distracts from core kdb architecture exploration.
-
-### 5. Historical Database (HDB)
-Rejected because:
-- Requires logging to populate.
-- Historical analysis is out of scope for current phase.
-- Adds operational complexity (EOD rollover, partitioning, etc.).
+Rejected:
+- Adds architectural complexity
+- Overkill for current scale
+- May be reconsidered for production
 
 ## Consequences
 
 ### Positive
 
-- Simple and fast ingestion path.
-- Clear architectural responsibilities.
-- Easier reasoning about latency measurements.
-- Faster iteration during development.
-- Lower latency due to no disk I/O in critical path.
-- No operational burden of log management.
+- Performance testing via replay now possible
+- Debugging workflows improved
+- Foundation for recovery laid
+- Optional (no impact when disabled)
+- Simple implementation
 
 ### Negative / Trade-offs
 
-- Data is lost if any component restarts.
-- No historical replay from kdb logs.
-- Downstream consumers must tolerate gaps after restarts.
-- RTE rolling analytics are invalid after restart until window refills.
-- No historical analysis capability.
-- No audit trail or regulatory compliance.
+- Log files consume disk space
+- Log format is binary (not human-readable)
+- No automatic recovery (manual replay required)
+- Fixed message size assumption (145 bytes)
 
-These trade-offs are acceptable given the project's exploratory and educational nature.
+## Implementation Details
+
+### Log File Structure
+
+```
+logs/
+└── 2025.12.24.log    # Binary IPC format
+```
+
+### Replay Tool
+
+`replay.q` reads log files and sends to target RTE:
+
+```bash
+q kdb/replay.q -port 5012
+.replay.run[]
+```
+
+Performance: 447K msg/s replay rate.
+
+### Standalone Mode
+
+RTE supports `-standalone` flag for replay testing without TP connection:
+
+```bash
+q kdb/rte.q -standalone
+```
 
 ## Future Evolution
 
-If durability becomes a requirement, the following changes may be introduced:
-
-| Change | Impact |
-|--------|--------|
-| Enable tickerplant logging | Requires log directory, rotation policy |
-| Add replay tooling | Repopulate RDB/RTE on restart |
-| Introduce HDB | End-of-day rollover, partitioned storage |
-| Sequence-number gap detection | Validate replay completeness |
-
-Such changes would not require modification of:
-- The feed handler
-- The trade schema
-- ADR-001 (timestamps) or ADR-002 (ingestion path)
-
-A new ADR will be created if durability requirements change.
+| Enhancement | Status |
+|-------------|--------|
+| TP logging | ✓ Implemented |
+| Replay tooling | ✓ Implemented |
+| Automatic RDB recovery | Planned |
+| HDB for historical queries | Out of scope |
+| Log compression | Out of scope |
 
 ## Links / References
 
 - `../kdbx-real-time-architecture-reference.md`
-- `../kdbx-real-time-architecture-measurement-notes.md`
-- `adr-001-timestamps-and-latency-measurement.md` (telemetry schema)
-- `adr-002-feed-handler-to-kdb-ingestion-path.md` (async IPC, no buffering)
-- `adr-004-real-time-rolling-analytics-computation.md` (RTE state implications)
-- `adr-006-recovery-and-replay-strategy.md` (recovery deferral)
-- `adr-007-visualisation-and-consumption-strategy.md` (observability)
+- `adr-002-feed-handler-to-kdb-ingestion-path.md` (async IPC)
+- `adr-006-recovery-and-replay-strategy.md` (replay capability)
+- `kdb/tp.q` (logging implementation)
+- `kdb/replay.q` (replay tool)
