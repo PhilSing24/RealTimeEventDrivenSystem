@@ -13,7 +13,7 @@
  *   - JSON parsing and normalization
  *   - Timestamp capture (wall-clock and monotonic)
  *   - Latency instrumentation (parse time, send time)
- *   - Sequence numbering for gap detection
+ *   - Sequence numbering for gap detection (FH + Binance tradeId)
  *   - IPC publication to tickerplant with reconnect
  * 
  * Design decisions:
@@ -43,6 +43,7 @@
 #include <chrono>
 #include <vector>
 #include <thread>
+#include <unordered_map>
 
 // kdb+ C API header (extern "C" required for C++ linkage)
 extern "C" {
@@ -145,6 +146,51 @@ int connectToTP() {
         std::cerr << "[FH] Failed to connect to TP\n";
         sleepWithBackoff(attempt++);
     }
+}
+
+// ============================================================================
+// SEQUENCE VALIDATION
+// ============================================================================
+
+// Track last tradeId per symbol for gap detection
+// Note: Binance tradeIds are unique per symbol but not guaranteed contiguous
+std::unordered_map<std::string, long long> lastTradeId;
+
+/**
+ * @brief Validate tradeId sequence and log anomalies
+ * 
+ * Binance doesn't guarantee contiguous tradeIds - gaps can occur during
+ * exchange maintenance or matching engine restarts. Out-of-order is more serious.
+ * 
+ * @param sym Symbol name
+ * @param tradeId Current trade ID
+ */
+void validateTradeId(const std::string& sym, long long tradeId) {
+    auto it = lastTradeId.find(sym);
+    
+    if (it != lastTradeId.end()) {
+        long long last = it->second;
+        
+        if (tradeId < last) {
+            // Out of order — definitely a problem
+            std::cerr << "[FH] OUT OF ORDER: " << sym 
+                      << " last=" << last 
+                      << " got=" << tradeId << std::endl;
+        } else if (tradeId == last) {
+            // Duplicate — shouldn't happen
+            std::cerr << "[FH] DUPLICATE: " << sym 
+                      << " tradeId=" << tradeId << std::endl;
+        } else if (tradeId > last + 1) {
+            // Gap — log but don't treat as error (can be normal)
+            long long missed = tradeId - last - 1;
+            std::cout << "[FH] Gap: " << sym 
+                      << " missed=" << missed 
+                      << " (last=" << last << " got=" << tradeId << ")" << std::endl;
+        }
+        // else: tradeId == last + 1, normal case
+    }
+    
+    lastTradeId[sym] = tradeId;
 }
 
 // ============================================================================
@@ -257,6 +303,9 @@ int run_feed_handler() {
                 bool buyerIsMaker = d["m"].GetBool();        // True if buyer is market maker
                 long long exchEventTimeMs = d["E"].GetInt64(); // Exchange event time (ms)
                 long long exchTradeTimeMs = d["T"].GetInt64(); // Exchange trade time (ms)
+
+                // ---- Validate tradeId sequence ----
+                validateTradeId(sym, tradeId);
 
                 // ---- End monotonic timer for parse latency ----
                 auto parseEnd = std::chrono::steady_clock::now();
