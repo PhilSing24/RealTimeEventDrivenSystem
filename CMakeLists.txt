@@ -17,25 +17,38 @@ find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 
 # -------------------------------------------------------------------
-# Executable
+# Main Executable
 # -------------------------------------------------------------------
 add_executable(binance_feed_handler
     src/main.cpp
     src/feed_handler.cpp
 )
 
-# -------------------------------------------------------------------
-# Include paths
-# -------------------------------------------------------------------
 target_include_directories(binance_feed_handler PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/kdb
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(binance_feed_handler
+    ${PROJECT_SOURCE_DIR}/third_party/kdb/c.o
+    Boost::system
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
 )
 
 # -------------------------------------------------------------------
-# Link libraries
+# Snapshot Test Executable
 # -------------------------------------------------------------------
-target_link_libraries(binance_feed_handler
-    ${PROJECT_SOURCE_DIR}/third_party/kdb/c.o
+add_executable(test_snapshot
+    src/test_snapshot.cpp
+)
+
+target_include_directories(test_snapshot PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_snapshot
     Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto
