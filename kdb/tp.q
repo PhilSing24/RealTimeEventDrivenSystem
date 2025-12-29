@@ -1,21 +1,11 @@
-/ tp.q
-/ Tickerplant with pub-sub, timestamp capture, and logging
+/ tp.q - Tickerplant
 
-/ -------------------------------------------------------
 / Configuration
-/ -------------------------------------------------------
-
-.tp.cfg.port:5010;
-.tp.cfg.logDir:"logs";
+.u.epochOffset:946684800000000000j;
 .tp.cfg.logEnabled:1b;
+.tp.cfg.logDir:"logs";
 
-/ Epoch offset: nanoseconds between 2000.01.01 and 1970.01.01
-.tp.epochOffset:946684800000000000j;
-
-/ -------------------------------------------------------
-/ Table schema (13 fields - TP does not know rdbApplyTimeUtcNs)
-/ -------------------------------------------------------
-
+/ Trade table - 13 fields
 trade_binance:([]
   time:`timestamp$();
   sym:`symbol$();
@@ -32,113 +22,91 @@ trade_binance:([]
   tpRecvTimeUtcNs:`long$()
   );
 
-/ -------------------------------------------------------
-/ Logging
-/ -------------------------------------------------------
+/ Quote table - 11 fields
+quote_binance:([]
+  time:`timestamp$();
+  sym:`symbol$();
+  bidPx:`float$();
+  bidQty:`float$();
+  askPx:`float$();
+  askQty:`float$();
+  isValid:`boolean$();
+  exchEventTimeMs:`long$();
+  fhRecvTimeUtcNs:`long$();
+  fhSeqNo:`long$();
+  tpRecvTimeUtcNs:`long$()
+  );
 
-/ Build log file path for today
-.tp.logFile:{
-  hsym `$(.tp.cfg.logDir,"/",string[.z.D],".log")
-  };
-
-/ Open log file
-.tp.openLog:{[]
-  if[not .tp.cfg.logEnabled; :()];
-  .tp.logHandle:hopen .tp.logFile[];
-  -1 "Log file opened: ",string .tp.logFile[];
-  };
-
-/ Close log file
-.tp.closeLog:{[]
-  if[not .tp.cfg.logEnabled; :()];
-  if[not null .tp.logHandle; hclose .tp.logHandle];
-  };
-
-/ Write to log
-.tp.log:{[tbl;data]
-  if[not .tp.cfg.logEnabled; :()];
-  .tp.logHandle enlist (`.u.upd; tbl; data);
-  };
-
-/ Rotate log (call at end of day)
-.tp.rotate:{[]
-  .tp.closeLog[];
-  .tp.openLog[];
-  };
-
-/ Log handle (set at startup)
-.tp.logHandle:0N;
-
-/ -------------------------------------------------------
-/ Pub/Sub Infrastructure (.u namespace - kdb+ convention)
-/ -------------------------------------------------------
-
-/ Subscriber dictionary: table -> list of handles
-.u.w:enlist[`trade_binance]!enlist `int$();
+/ Subscriber registry
+.u.w:`trade_binance`quote_binance!(();())
 
 / Subscribe function
-/ Called by downstream processes (RDB, RTE)
-/ Returns: (table name; current schema; log file path; log message count)
 .u.sub:{[tbl;syms]
   if[not tbl in key .u.w; '"unknown table: ",string tbl];
   .u.w[tbl],::.z.w;
-  (tbl; value tbl; .tp.logFile[]; count value tbl)
+  (tbl; value tbl)
   };
 
-/ Publish to all subscribers of a table
+/ Publish to subscribers
 .u.pub:{[tbl;data]
-  {[h;tbl;data] neg[h] (`.u.upd; tbl; data)} [;tbl;data] each .u.w[tbl];
+  {[h;tbl;data] neg[h] (`.u.upd; tbl; data)}[;tbl;data] each .u.w[tbl];
   };
 
 / Handle subscriber disconnect
 .z.pc:{[h]
   .u.w:{x except h} each .u.w;
+  -1 "Subscriber disconnected: handle ",string h;
   };
 
-/ -------------------------------------------------------
-/ Update handling
-/ -------------------------------------------------------
+/ Log file paths
+.tp.tradeLogFile:{[] hsym `$(.tp.cfg.logDir),"/",string[.z.d],".trade.log"};
+.tp.quoteLogFile:{[] hsym `$(.tp.cfg.logDir),"/",string[.z.d],".quote.log"};
 
-/ Convert kdb timestamp to nanoseconds since Unix epoch
-.tp.tsToNs:{[ts]
-  .tp.epochOffset + "j"$ts - 2000.01.01D0
+/ Initialize log handles
+.tp.initLog:{[]
+  if[not .tp.cfg.logEnabled; :()];
+  system "mkdir -p ",.tp.cfg.logDir;
+  .tp.tradeLogHandle:hopen .tp.tradeLogFile[];
+  .tp.quoteLogHandle:hopen .tp.quoteLogFile[];
+  -1 "Trade log: ",1_string .tp.tradeLogFile[];
+  -1 "Quote log: ",1_string .tp.quoteLogFile[];
   };
 
-/ Core update function
-/ Called by feed handler via .z.ps -> .u.upd
+/ Log update to appropriate file
+.tp.log:{[tbl;data]
+  if[not .tp.cfg.logEnabled; :()];
+  $[tbl = `trade_binance;
+    .tp.tradeLogHandle enlist (`.u.upd; tbl; data);
+    .tp.quoteLogHandle enlist (`.u.upd; tbl; data)
+  ];
+  };
+
+/ Rotate logs
+.tp.rotate:{[]
+  if[not .tp.cfg.logEnabled; :()];
+  @[hclose; .tp.tradeLogHandle; {}];
+  @[hclose; .tp.quoteLogHandle; {}];
+  .tp.tradeLogHandle:hopen .tp.tradeLogFile[];
+  .tp.quoteLogHandle:hopen .tp.quoteLogFile[];
+  -1 "Logs rotated";
+  };
+
+/ Convert timestamp to nanoseconds
+.u.tsToNs:{[ts] .u.epochOffset + "j"$ts - 2000.01.01D0};
+
+/ Update handler
 .u.upd:{[tbl;data]
-  / Capture TP receive time
   tpRecvTs:.z.p;
-  tpRecvTimeUtcNs:.tp.tsToNs[tpRecvTs];
-  
-  / Add tpRecvTimeUtcNs to the row
-  / data arrives as a list (single row) - append the new field
+  tpRecvTimeUtcNs:.u.tsToNs[tpRecvTs];
   data:data,tpRecvTimeUtcNs;
-  
-  / Log to disk
   .tp.log[tbl;data];
-  
-  / Insert locally
   tbl insert data;
-  
-  / Publish to subscribers
   .u.pub[tbl;data];
   };
 
-/ -------------------------------------------------------
 / Startup
-/ -------------------------------------------------------
-
-system "p ",string .tp.cfg.port;
-
--1 "TP starting on port ",string[.tp.cfg.port];
+\p 5010
+.tp.initLog[];
+-1 "Tickerplant started on port 5010";
+-1 "Tables: trade_binance, quote_binance";
 -1 "Logging: ",$[.tp.cfg.logEnabled; "enabled"; "disabled"];
-
-/ Open log file
-.tp.openLog[];
-
--1 "Subscribers: ", .Q.s1 .u.w;
-
-/ -------------------------------------------------------
-/ End
-/ -------------------------------------------------------

@@ -1,41 +1,33 @@
 # Real-Time Event-Driven Market Data System
 
-A real-time, event-driven Binance trades pipeline built with C++ and kdb+/KDB-X. Inspired by the article *Building Real-Time Event-Driven KDB-X Systems* by Data Intellect.
-
-The original article has been carefully rewritten and restructured to be LLM-friendly, while (hopefully) preserving the depth, precision, and engineering intent of the source material. The rewritten version kdbx-real-time-architecture-reference is available as a Markdown document in the docs/ directory, alongside a set of Architecture Decision Records (ADRs) in the docs/decisions. Together, these documents serve as both a technical reference and a companion to the implementation in this repository.
-
+A real-time, event-driven Binance market data pipeline built with C++ and kdb+/KDB-X. Inspired by the article *Building Real-Time Event-Driven KDB-X Systems* by Data Intellect.
 
 ## Architecture
-
-```mermaid
-flowchart LR
-    B[Binance] --> FH[Feed Handler]
-    FH --> TP[TP :5010]
-    TP --> RDB[RDB :5011<br/>storage]
-    TP --> RTE[RTE :5012<br/>analytics]
-    TEL[TEL :5013<br/>telemetry] -.->|queries| RDB
-    TEL -.->|queries| RTE
+```
+Binance ---WebSocket---> Trade FH ---IPC---> TP :5010 --+--> RDB :5011 (storage)
+                                                       |
+Binance ---WebSocket---> Quote FH ---IPC--->           +--> RTE :5012 (analytics)
 ```
 
 | Component | Port | Role |
 |-----------|------|------|
-| TP | 5010 | Tickerplant - pub/sub distribution |
-| RDB | 5011 | Real-Time Database - storage only |
+| TP | 5010 | Tickerplant - pub/sub, logging |
+| RDB | 5011 | Real-Time Database - trade storage |
 | RTE | 5012 | Real-Time Engine - rolling analytics |
-| TEL | 5013 | Telemetry - aggregates latency/throughput metrics |
-| FH | - | Feed Handler - WebSocket to IPC |
+| Trade FH | - | Trade feed handler - WebSocket to IPC |
+| Quote FH | - | Quote feed handler - L1 book with snapshot reconciliation |
 
 ## What This Project Does
 
 - Ingests **real-time trade data** from Binance (BTCUSDT, ETHUSDT)
+- Ingests **real-time L1 quotes** with snapshot + delta reconciliation
 - Captures **latency measurements** at every pipeline stage
 - Publishes via **IPC** to a kdb+ tickerplant with pub/sub
 - Stores trades with **full instrumentation** (14 timestamp/latency fields)
 - Computes **rolling analytics** (5-minute average price, trade count)
-- Aggregates **telemetry metrics** (p50/p95/max latencies, throughput) every 5 seconds
+- Logs to **separate files** for trades and quotes
 
 ## Quick Start
-
 ```bash
 # Terminal 1: Start Tickerplant
 q kdb/tp.q
@@ -46,13 +38,13 @@ q kdb/rdb.q
 # Terminal 3: Start RTE
 q kdb/rte.q
 
-# Terminal 4: Start TEL
-q kdb/tel.q
-
-# Terminal 5: Build and run Feed Handler
+# Terminal 4: Build and run Trade Feed Handler
 cmake -S . -B build
 cmake --build build
 ./build/binance_feed_handler
+
+# Terminal 5: Run Quote Feed Handler
+./build/binance_quote_handler
 ```
 
 Or use the tmux launcher:
@@ -62,7 +54,13 @@ Or use the tmux launcher:
 
 ## Verify It Works
 
-**RDB (port 5011)** - raw trades:
+**TP (port 5010)** - both trades and quotes:
+```q
+select count i by sym from trade_binance
+select count i by sym from quote_binance
+```
+
+**RDB (port 5011)** - trades only:
 ```q
 select count i by sym from trade_binance
 select from -5#trade_binance
@@ -74,78 +72,92 @@ rollAnalytics
 / isValid flips to 1b once window is 50% filled (~2.5 min)
 ```
 
-**TEL (port 5013)** - telemetry:
-```q
-select from telemetry_latency_e2e where bucket = max bucket
-select from telemetry_latency_fh where bucket = max bucket
-select from telemetry_throughput where bucket = max bucket
-select from telemetry_analytics_health where bucket = max bucket
-```
-
 ## Configuration
 
 ### Adding/Removing Symbols
 
-Edit the `SYMBOLS` vector in `src/feed_handler.cpp`:
-
+**Trade handler** - edit `src/feed_handler.cpp`:
 ```cpp
 const std::vector<std::string> SYMBOLS = {
     "btcusdt",
     "ethusdt"
-    // Add more symbols here (lowercase)
 };
 ```
 
-Rebuild and restart the feed handler. No changes needed to kdb+ components.
+**Quote handler** - edit `src/quote_handler_main.cpp`:
+```cpp
+const std::vector<std::string> SYMBOLS = {
+    "btcusdt",
+    "ethusdt"
+};
+```
+
+Rebuild and restart. No changes needed to kdb+ components.
 
 ### RTE Parameters
 
-Edit the configuration section at the top of `kdb/rte.q`:
-
+Edit `kdb/rte.q`:
 ```q
 .rte.cfg.windowNs:5 * 60 * 1000000000j;  / Rolling window: 5 minutes
 .rte.cfg.validityThreshold:0.5;          / 50% fill required for validity
 ```
 
-### TEL Parameters
-
-Edit the configuration section at the top of `kdb/tel.q`:
-
-```q
-.tel.cfg.bucketSec:5;        / Telemetry bucket size
-.tel.cfg.retentionMin:15;    / Retention period
-```
-
 ## Data Flow
-
 ```
-FH --> TP --+--> RDB (storage)
-            |
-            +--> RTE (analytics)
-
-TEL <-- queries both on timer
+Trade FH ---> TP --+--> RDB (trade storage)
+                   |
+Quote FH -------->-+--> RTE (analytics)
+                   |
+                   +--> Log files
 ```
 
-RDB and RTE are **peer subscribers** to the tickerplant. Each receives every trade independently. TEL queries both to aggregate metrics.
+- RDB subscribes to `trade_binance` only
+- RTE subscribes to `trade_binance` only
+- TP logs both to separate files
 
-## Latency Measurement Points
+## Log Files
+```
+logs/
+  2025.12.29.trade.log   # Binary trade log
+  2025.12.29.quote.log   # Binary quote log
+```
+
+## Tables
+
+### trade_binance (14 fields)
 
 | Field | Source | Description |
 |-------|--------|-------------|
-| `fhRecvTimeUtcNs` | FH | Wall-clock when WebSocket message received |
-| `fhParseUs` | FH | Parse/normalise duration (monotonic) |
-| `fhSendUs` | FH | IPC send prep duration (monotonic) |
-| `tpRecvTimeUtcNs` | TP | Wall-clock when TP receives message |
-| `rdbApplyTimeUtcNs` | RDB | Wall-clock when trade is query-consistent |
+| `time` | FH | FH receive time as kdb timestamp |
+| `sym` | Binance | Trading symbol |
+| `tradeId` | Binance | Trade ID |
+| `price` | Binance | Trade price |
+| `qty` | Binance | Trade quantity |
+| `buyerIsMaker` | Binance | Buyer is maker flag |
+| `exchEventTimeMs` | Binance | Exchange event time |
+| `exchTradeTimeMs` | Binance | Exchange trade time |
+| `fhRecvTimeUtcNs` | FH | Wall-clock receive (ns) |
+| `fhParseUs` | FH | Parse duration (us) |
+| `fhSendUs` | FH | Send prep duration (us) |
+| `fhSeqNo` | FH | Sequence number |
+| `tpRecvTimeUtcNs` | TP | TP receive time (ns) |
+| `rdbApplyTimeUtcNs` | RDB | RDB apply time (ns) |
 
-## Telemetry Tables (TEL)
+### quote_binance (11 fields)
 
-| Table | Contents |
-|-------|----------|
-| `telemetry_latency_fh` | FH segment latencies (p50/p95/max) by symbol |
-| `telemetry_latency_e2e` | Cross-process latencies (FH->TP->RDB) by symbol |
-| `telemetry_throughput` | Trade counts and volumes by symbol |
-| `telemetry_analytics_health` | RTE validity status by symbol |
+| Field | Source | Description |
+|-------|--------|-------------|
+| `time` | FH | FH receive time as kdb timestamp |
+| `sym` | Binance | Trading symbol |
+| `bidPx` | FH | Best bid price |
+| `bidQty` | FH | Best bid quantity |
+| `askPx` | FH | Best ask price |
+| `askQty` | FH | Best ask quantity |
+| `isValid` | FH | Book validity flag |
+| `exchEventTimeMs` | Binance | Exchange event time |
+| `fhRecvTimeUtcNs` | FH | Wall-clock receive (ns) |
+| `fhSeqNo` | FH | Sequence number |
+| `tpRecvTimeUtcNs` | TP | TP receive time (ns) |
 
 ## Rolling Analytics (RTE)
 
@@ -159,86 +171,79 @@ RDB and RTE are **peer subscribers** to the tickerplant. Each receives every tra
 | `windowStart` | Oldest trade time in window |
 | `updateTime` | Last analytics update time |
 
-## Project Structure
+## Quote Handler Features
 
+- **Snapshot + delta reconciliation** per Binance spec
+- **State machine**: INIT -> SYNCING -> VALID -> INVALID
+- **Sequence validation**: gaps trigger rebuild
+- **L1 publication**: only on price/qty change or 50ms timeout
+- **Validity tracking**: `isValid` flag for downstream consumers
+
+## Project Structure
 ```
 .
 ├── CMakeLists.txt
 ├── src/
-│   ├── main.cpp
-│   └── feed_handler.cpp          # C++ WebSocket client + IPC publisher
+│   ├── main.cpp                  # Trade FH entry point
+│   ├── feed_handler.cpp          # Trade WebSocket + IPC
+│   ├── quote_handler_main.cpp    # Quote FH entry point
+│   ├── quote_handler.hpp         # Quote WebSocket + reconciliation
+│   ├── order_book.hpp            # OrderBook class + L1Publisher
+│   ├── rest_client.hpp           # REST snapshot client
+│   └── test_snapshot.cpp         # Snapshot test utility
 ├── kdb/
-│   ├── tp.q                      # Tickerplant with pub/sub
-│   ├── rdb.q                     # RDB - storage only
-│   ├── rte.q                     # RTE - rolling analytics
-│   └── tel.q                     # TEL - telemetry aggregation
-├── third_party/
-│   └── kdb/
-│       ├── k.h                   # kdb+ C API header
-│       └── c.o                   # kdb+ C API library
-├── start.sh                      # tmux launcher
-├── stop.sh                       # Stop all processes
+│   ├── tp.q                      # Tickerplant
+│   ├── rdb.q                     # RDB - trade storage
+│   └── rte.q                     # RTE - rolling analytics
+├── third_party/kdb/
+│   ├── k.h
+│   └── c.o
+├── start.sh
+├── stop.sh
 └── docs/
-    ├── README.md
     ├── kdbx-real-time-architecture-reference.md
     ├── kdbx-real-time-architecture-measurement-notes.md
     ├── api-binance.md
     ├── specs/
-    │   └── trades-schema.md      # Canonical schema definition
+    │   └── trades-schema.md
     └── decisions/
-        ├── adr-001-timestamps-and-latency-measurement.md
-        ├── adr-002-feed-handler-to-kdb-ingestion-path.md
-        ├── adr-003-tickerplant-logging-and-durability-strategy.md
-        ├── adr-004-real-time-rolling-analytics-computation.md
-        ├── adr-005-telemetry-and-metrics-aggregation-strategy.md
-        ├── adr-006-recovery-and-replay-strategy.md
-        ├── adr-007-visualisation-and-consumption-strategy.md
-        └── adr-008-error-handling-strategy.md
+        └── adr-*.md
 ```
 
 ## Design Principles
 
-- **Documentation-first**: Architecture decisions documented before code
-- **Measurement discipline**: Latency captured at every stage with explicit trust model
-- **Event-driven**: Tick-by-tick processing, no batching
-- **Separation of concerns**: Storage (RDB), Analytics (RTE), Telemetry (TEL)
-- **Ephemeral by design**: No persistence; focus on real-time behaviour
+- **Documentation-first**: ADRs before code
+- **Measurement discipline**: Latency at every stage
+- **Event-driven**: Tick-by-tick, no batching
+- **Separation of concerns**: Trade FH, Quote FH, RDB, RTE
+- **Single responsibility**: One process, one job
+- **Ephemeral by design**: Focus on real-time behaviour
 
 ## Implementation Status
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Feed Handler | Complete | Multi-symbol, full instrumentation |
-| Tickerplant | Complete | Pub/sub, timestamp capture |
-| RDB | Complete | Storage only (telemetry moved to TEL) |
-| RTE | Complete | Rolling analytics, validity tracking |
-| TEL | Complete | Queries RDB+RTE, aggregates metrics |
-| Dashboards | Planned | KX Dashboards visualisation |
-
+| Component | Status |
+|-----------|--------|
+| Trade Feed Handler | Complete |
+| Quote Feed Handler | Complete |
+| Tickerplant | Complete |
+| RDB | Complete |
+| RTE | Complete |
+| Dashboards | Planned |
 
 ## Dependencies
 
-- **C++17** compiler (GCC/Clang)
-- **CMake** 3.16+
-- **Boost** (Beast, Asio)
-- **OpenSSL**
-- **RapidJSON**
-- **kdb+** 4.x (with valid license)
-- **tmux** (optional, for start.sh)
-
-## Documentation
-
-| Document | Purpose |
-|----------|---------|
-| [Architecture Reference](docs/kdbx-real-time-architecture-reference.md) | Design patterns for real-time KDB-X systems |
-| [Measurement Notes](docs/kdbx-real-time-architecture-measurement-notes.md) | Latency measurement definitions and trust model |
-| [Trades Schema](docs/specs/trades-schema.md) | Canonical schema with all 14 fields |
-| [ADRs](docs/decisions/) | Architecture Decision Records |
+- C++17 compiler
+- CMake 3.16+
+- Boost (Beast, Asio)
+- OpenSSL
+- RapidJSON
+- kdb+ 4.x
+- tmux (optional)
 
 ## License
 
-This project is for educational and exploratory purposes.
+Educational and exploratory purposes.
 
 ## Acknowledgements
 
-Architecture patterns derived from [Building Real Time Event Driven KDB-X Systems](https://dataintellect.com/) by Data Intellect.
+Architecture patterns from [Building Real Time Event Driven KDB-X Systems](https://dataintellect.com/) by Data Intellect.

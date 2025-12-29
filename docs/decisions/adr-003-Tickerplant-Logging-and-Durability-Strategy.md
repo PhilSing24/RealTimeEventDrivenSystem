@@ -1,10 +1,10 @@
 # ADR-003: Tickerplant Logging and Durability Strategy
 
 ## Status
-Accepted (Updated 2025-12-24)
+Accepted (Updated 2025-12-29)
 
 ## Date
-2025-12-17 (Updated 2025-12-24)
+2025-12-17 (Updated 2025-12-29)
 
 ## Context
 
@@ -14,13 +14,11 @@ In a canonical kdb real-time architecture, the tickerplant (TP) is responsible f
 - Publishing updates to real-time databases (RDBs)
 - Optionally providing a durability boundary via logging
 
-This project ingests real-time Binance trade data through an external C++ feed handler and publishes it directly into a tickerplant via IPC (ADR-002).
+This project ingests real-time Binance market data:
+- Trade data via WebSocket trade stream
+- Quote data via WebSocket depth stream with REST snapshot reconciliation
 
-A key design decision is whether the tickerplant should:
-- Log incoming updates to disk (durable TP), or
-- Operate purely in-memory (non-durable TP)
-
-This decision affects recovery semantics, operational complexity, latency, and alignment with the project's exploratory goals.
+A key design decision is whether and how the tickerplant should log incoming updates.
 
 ## Notation
 
@@ -35,181 +33,145 @@ This decision affects recovery semantics, operational complexity, latency, and a
 
 ## Decision
 
-The tickerplant implements **optional persistent logging**, disabled by default.
+The tickerplant logs incoming updates to **separate binary log files** per data type.
 
-### Update (2025-12-24)
-
-TP logging has been implemented to support:
-- Performance testing via log replay
-- Development and debugging workflows
-- Future recovery capabilities
-
-### Architecture
-
-The tickerplant now supports both modes:
-- **Logging disabled** (default): Pure distribution, no disk I/O
-- **Logging enabled**: Writes to `logs/` directory with daily rotation
-
-### Configuration
-
-```q
-.tp.cfg.logEnabled:1b;          / Enable/disable logging
-.tp.cfg.logDir:"logs";          / Log directory
+### Log File Structure
+```
+logs/
+  2025.12.29.trade.log   # Trade events only
+  2025.12.29.quote.log   # Quote events only
 ```
 
-### Log Format
+### Log File Naming
 
-- One file per day: `logs/YYYY.MM.DD.log`
-- Binary IPC format (serialized q objects)
-- Each message: `(`.u.upd; tablename; rowdata)`
-- Fixed message size: 145 bytes per trade
+| Data Type | Pattern | Example |
+|-----------|---------|---------|
+| Trades | `YYYY.MM.DD.trade.log` | `2025.12.29.trade.log` |
+| Quotes | `YYYY.MM.DD.quote.log` | `2025.12.29.quote.log` |
 
-### Logging Implementation
+### Logging Configuration
+```q
+.tp.cfg.logEnabled:1b;
+.tp.cfg.logDir:"logs";
+```
 
+### Implementation
+
+The TP maintains separate file handles:
+```q
+.tp.tradeLogHandle   / Handle for trade log
+.tp.quoteLogHandle   / Handle for quote log
+```
+
+Routing logic in `.tp.log`:
 ```q
 .tp.log:{[tbl;data]
   if[not .tp.cfg.logEnabled; :()];
-  .tp.logHandle enlist (`.u.upd; tbl; data);
+  $[tbl = `trade_binance;
+    .tp.tradeLogHandle enlist (`.u.upd; tbl; data);
+    .tp.quoteLogHandle enlist (`.u.upd; tbl; data)
+  ];
   };
 ```
 
-Key characteristics:
-- Async append (non-blocking)
-- No compression
-- Daily rotation via `.tp.rotate[]`
+### Rationale for Separate Files
+
+| Benefit | Description |
+|---------|-------------|
+| Independent replay | Replay trades without quotes or vice versa |
+| Different consumers | RTE only needs trades |
+| Debugging | Isolate issues to specific data type |
+| Retention | Could have different retention policies |
+| Size management | Trade and quote volumes differ |
 
 ### End-of-Day Behaviour
 
-- Log files rotate at midnight or on manual `.tp.rotate[]` call
-- Old logs retained for replay/debugging
-- No Historical Database (HDB) - logs are for replay, not query
+- Log rotation occurs at midnight (new date = new files)
+- `.tp.rotate[]` function closes old handles, opens new
+- No Historical Database (HDB) implemented
+- Logs are retained for replay/debugging but not persisted to HDB
 
 ### Downstream Recovery Implications
 
-With logging enabled, downstream components can recover via replay:
-
-| Component | On Restart | Recovery Method |
+| Component | On Restart | Recovery Source |
 |-----------|------------|-----------------|
-| TP | Restarts empty | N/A (stateless) |
-| RDB | Starts empty | Replay from TP log |
-| RTE | State lost | Replay from TP log |
+| RDB | Starts empty | Replay from trade log |
+| RTE | State lost | Replay from trade log |
+| TP | Logs reset | N/A |
 
-Recovery via replay is now supported (see ADR-006).
+### Tables Logged
 
-### System-Wide Durability Stance
-
-| Mode | Data Recovery |
-|------|---------------|
-| Logging disabled | No recovery; data lost on any failure |
-| Logging enabled | Replay possible from log files |
-
-### Performance Impact
-
-Logging adds minimal overhead:
-- Async file I/O (non-blocking)
-- ~145 bytes per trade
-- No measurable latency impact at current message rates
+| Table | Log File | Subscribers |
+|-------|----------|-------------|
+| `trade_binance` | `.trade.log` | RDB, RTE |
+| `quote_binance` | `.quote.log` | (TP only currently) |
 
 ## Rationale
 
-Logging was implemented because:
+Separate log files were selected because:
 
-- Enables performance testing via replay (447K msg/s measured)
-- Supports development and debugging workflows
-- Provides foundation for future recovery capabilities
-- Minimal complexity (optional, disabled by default)
-- No significant latency impact
-
-### Latency Considerations
-
-With logging disabled:
-- No disk I/O in critical path
-- Lowest possible latency
-
-With logging enabled:
-- Async writes minimize impact
-- Suitable for development/testing
-- Production deployments can disable if latency-critical
+- **Replay flexibility**: Can replay trades to RTE without quote noise
+- **Consumer alignment**: RDB/RTE only subscribe to trades currently
+- **Debugging**: Easier to isolate issues per data type
+- **Future-proof**: Different retention or archival policies possible
 
 ## Alternatives Considered
 
-### 1. No logging at all
-Originally selected, later revised:
-- Prevented replay-based testing
-- Made debugging difficult
-- Limited future recovery options
-
-### 2. Synchronous logging
+### 1. Single combined log file
 Rejected:
-- Adds latency to critical path
-- Blocks on disk I/O
-- Not necessary for exploratory project
+- Must replay everything to get anything
+- Larger files to scan
+- Mixed data types complicate debugging
 
-### 3. Separate Logger Process
+### 2. No logging (original design)
+Updated:
+- Logging now enabled by default
+- Provides replay capability
+- Minimal latency impact
+
+### 3. Per-symbol log files
 Rejected:
-- Adds architectural complexity
+- Too many files (2 symbols x 2 types = 4 files)
+- Complicates replay
 - Overkill for current scale
-- May be reconsidered for production
+
+### 4. Separate logger process
+Rejected:
+- Adds complexity
+- TP can handle logging efficiently
+- Not needed at current scale
 
 ## Consequences
 
 ### Positive
 
-- Performance testing via replay now possible
-- Debugging workflows improved
-- Foundation for recovery laid
-- Optional (no impact when disabled)
+- Independent replay per data type
+- Cleaner debugging
+- Flexible recovery options
+- Minimal latency impact
 - Simple implementation
 
 ### Negative / Trade-offs
 
-- Log files consume disk space
-- Log format is binary (not human-readable)
-- No automatic recovery (manual replay required)
-- Fixed message size assumption (145 bytes)
+- Two file handles to manage
+- Log rotation must handle both files
+- Slightly more complex than single file
 
-## Implementation Details
+These trade-offs are acceptable.
 
-### Log File Structure
+## Replay Support
 
-```
-logs/
-└── 2025.12.24.log    # Binary IPC format
-```
-
-### Replay Tool
-
-`replay.q` reads log files and sends to target RTE:
-
+Replay tool (`kdb/replay.q`) supports targeting specific log types:
 ```bash
-q kdb/replay.q -port 5012
-.replay.run[]
+# Replay trades only
+q kdb/replay.q -logfile logs/2025.12.29.trade.log
+
+# Replay quotes only
+q kdb/replay.q -logfile logs/2025.12.29.quote.log
 ```
-
-Performance: 447K msg/s replay rate.
-
-### Standalone Mode
-
-RTE supports `-standalone` flag for replay testing without TP connection:
-
-```bash
-q kdb/rte.q -standalone
-```
-
-## Future Evolution
-
-| Enhancement | Status |
-|-------------|--------|
-| TP logging | ✓ Implemented |
-| Replay tooling | ✓ Implemented |
-| Automatic RDB recovery | Planned |
-| HDB for historical queries | Out of scope |
-| Log compression | Out of scope |
 
 ## Links / References
 
 - `../kdbx-real-time-architecture-reference.md`
-- `adr-002-feed-handler-to-kdb-ingestion-path.md` (async IPC)
-- `adr-006-recovery-and-replay-strategy.md` (replay capability)
-- `kdb/tp.q` (logging implementation)
-- `kdb/replay.q` (replay tool)
+- `adr-006-recovery-and-replay-strategy.md` (replay mechanism)
+- `adr-009-l1-order-book-architecture.md` (quote data source)
