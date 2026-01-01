@@ -10,18 +10,23 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 
+# Include directories
+set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/cpp/include)
+set(KDB_DIR ${PROJECT_SOURCE_DIR}/cpp/third_party/kdb)
+
 # Trade feed handler
 add_executable(binance_feed_handler
-    src/main.cpp
-    src/feed_handler.cpp
+    cpp/src/main.cpp
+    cpp/src/feed_handler.cpp
 )
 
 target_include_directories(binance_feed_handler PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/kdb
+    ${INCLUDE_DIR}
+    ${KDB_DIR}
 )
 
 target_link_libraries(binance_feed_handler
-    ${PROJECT_SOURCE_DIR}/third_party/kdb/c.o
+    ${KDB_DIR}/c.o
     Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto
@@ -30,28 +35,30 @@ target_link_libraries(binance_feed_handler
 
 # Quote feed handler
 add_executable(binance_quote_handler
-    src/quote_handler_main.cpp
+    cpp/src/quote_handler_main.cpp
 )
 
 target_include_directories(binance_quote_handler PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/kdb
+    ${INCLUDE_DIR}
+    ${KDB_DIR}
 )
 
 target_link_libraries(binance_quote_handler
-    ${PROJECT_SOURCE_DIR}/third_party/kdb/c.o
+    ${KDB_DIR}/c.o
     Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
 )
 
-# Snapshot test (optional, keep for debugging)
+# Snapshot test
 add_executable(test_snapshot
-    src/test_snapshot.cpp
+    cpp/src/test_snapshot.cpp
 )
 
 target_include_directories(test_snapshot PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/kdb
+    ${INCLUDE_DIR}
+    ${KDB_DIR}
 )
 
 target_link_libraries(test_snapshot
