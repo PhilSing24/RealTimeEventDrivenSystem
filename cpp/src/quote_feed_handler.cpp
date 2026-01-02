@@ -6,6 +6,7 @@
 #include "quote_feed_handler.hpp"
 
 #include <rapidjson/document.h>
+#include <spdlog/spdlog.h>
 
 #include <iostream>
 #include <chrono>
@@ -22,6 +23,7 @@ QuoteFeedHandler::QuoteFeedHandler(const std::vector<std::string>& symbols,
     : symbols_(symbols)
     , tpHost_(tpHost)
     , tpPort_(tpPort)
+    , startTime_(std::chrono::system_clock::now())
 {
     // Initialize per-symbol state
     for (const auto& sym : symbols) {
@@ -35,7 +37,7 @@ QuoteFeedHandler::QuoteFeedHandler(const std::vector<std::string>& symbols,
 QuoteFeedHandler::~QuoteFeedHandler() {
     if (tpHandle_ > 0) {
         kclose(tpHandle_);
-        std::cout << "[Quote FH] TP connection closed in destructor\n";
+        spdlog::debug("TP connection closed in destructor");
     }
 }
 
@@ -44,14 +46,12 @@ QuoteFeedHandler::~QuoteFeedHandler() {
 // ============================================================================
 
 void QuoteFeedHandler::run() {
-    std::cout << "[Quote FH] Starting...\n";
-    std::cout << "[Quote FH] Symbols: ";
-    for (const auto& s : symbols_) std::cout << s << " ";
-    std::cout << "\n";
+    spdlog::info("Starting...");
+    spdlog::info("Symbols: {}", fmt::join(symbols_, " "));
     
     // Connect to tickerplant
     if (!connectToTP()) {
-        std::cout << "[Quote FH] Shutdown before TP connection established\n";
+        spdlog::warn("Shutdown before TP connection established");
         return;
     }
     
@@ -61,10 +61,10 @@ void QuoteFeedHandler::run() {
             runWebSocketLoop();
         } catch (const std::exception& e) {
             if (!running_) {
-                std::cout << "[Quote FH] Connection closed during shutdown\n";
+                spdlog::info("Connection closed during shutdown");
             } else {
-                std::cerr << "[Quote FH] Binance error: " << e.what() << "\n";
-                std::cerr << "[Quote FH] Will reconnect...\n";
+                spdlog::error("Binance error: {}", e.what());
+                spdlog::info("Will reconnect...");
                 if (!sleepWithBackoff(binanceReconnectAttempt_++)) {
                     break;
                 }
@@ -73,18 +73,18 @@ void QuoteFeedHandler::run() {
     }
     
     // Cleanup
-    std::cout << "[Quote FH] Cleaning up...\n";
+    spdlog::info("Cleaning up...");
     if (tpHandle_ > 0) {
         kclose(tpHandle_);
         tpHandle_ = -1;
-        std::cout << "[Quote FH] TP connection closed\n";
+        spdlog::info("TP connection closed");
     }
     
-    std::cout << "[Quote FH] Shutdown complete (processed " << fhSeqNo_ << " messages)\n";
+    spdlog::info("Shutdown complete (processed {} messages)", fhSeqNo_);
 }
 
 void QuoteFeedHandler::stop() {
-    std::cout << "[Quote FH] Stop requested\n";
+    spdlog::info("Stop requested");
     running_ = false;
 }
 
@@ -104,17 +104,17 @@ std::string QuoteFeedHandler::buildDepthStreamPath() const {
 bool QuoteFeedHandler::connectToTP() {
     int attempt = 0;
     while (running_) {
-        std::cout << "[Quote FH] Connecting to TP on " << tpHost_ << ":" << tpPort_ << "...\n";
+        spdlog::info("Connecting to TP on {}:{}...", tpHost_, tpPort_);
         
         int h = khpu((S)tpHost_.c_str(), tpPort_, (S)"");
         
         if (h > 0) {
             tpHandle_ = h;
-            std::cout << "[Quote FH] Connected to TP (handle " << h << ")\n";
+            spdlog::info("Connected to TP (handle {})", h);
             return true;
         }
         
-        std::cerr << "[Quote FH] Failed to connect to TP\n";
+        spdlog::error("Failed to connect to TP");
         if (!sleepWithBackoff(attempt++)) {
             return false;
         }
@@ -129,7 +129,7 @@ bool QuoteFeedHandler::sleepWithBackoff(int attempt) {
     }
     delay = std::min(delay, MAX_BACKOFF_MS);
     
-    std::cout << "[Quote FH] Waiting " << delay << "ms before reconnect...\n";
+    spdlog::info("Waiting {}ms before reconnect...", delay);
     
     const int checkIntervalMs = 100;
     int slept = 0;
@@ -155,7 +155,9 @@ void QuoteFeedHandler::resetAllBooks() {
 
 void QuoteFeedHandler::runWebSocketLoop() {
     std::string target = buildDepthStreamPath();
-    std::cout << "[Quote FH] Connecting to Binance: " << BINANCE_HOST << target << "\n";
+    spdlog::info("Connecting to Binance: {}{}", BINANCE_HOST, target);
+    
+    connState_ = "connecting";
     
     // Reset all books on reconnect
     resetAllBooks();
@@ -178,10 +180,14 @@ void QuoteFeedHandler::runWebSocketLoop() {
     // WebSocket handshake
     ws.handshake(BINANCE_HOST, target);
     
-    std::cout << "[Quote FH] Connected to Binance (" << symbols_.size() << " symbols)\n";
+    spdlog::info("Connected to Binance ({} symbols)", symbols_.size());
+    connState_ = "connected";
     
     // Reset backoff
     binanceReconnectAttempt_ = 0;
+    
+    // Health publish timer
+    auto lastHealthPub = std::chrono::steady_clock::now();
     
     // Message loop
     while (running_) {
@@ -194,18 +200,31 @@ void QuoteFeedHandler::runWebSocketLoop() {
         long long fhRecvTimeUtcNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
             recvTime.time_since_epoch()).count();
         
+        // Update health: message received
+        lastMsgTime_ = recvTime;
+        ++msgsReceived_;
+        
         std::string msg = beast::buffers_to_string(buffer.data());
         processMessage(msg, fhRecvTimeUtcNs);
         
         // Check publish timeouts
         checkPublishTimeouts(fhRecvTimeUtcNs);
+        
+        // Publish health every HEALTH_INTERVAL_SEC seconds
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastHealthPub).count() >= HEALTH_INTERVAL_SEC) {
+            publishHealth();
+            lastHealthPub = now;
+        }
     }
+    
+    connState_ = "disconnected";
     
     // Graceful close
     if (!running_) {
         try {
             ws.close(websocket::close_code::normal);
-            std::cout << "[Quote FH] WebSocket closed gracefully\n";
+            spdlog::info("WebSocket closed gracefully");
         } catch (...) {
             // Ignore errors during shutdown
         }
@@ -327,13 +346,13 @@ void QuoteFeedHandler::handleDelta(SymbolState& state, const BufferedDelta& delt
 // ============================================================================
 
 void QuoteFeedHandler::requestSnapshot(SymbolState& state) {
-    std::cout << "[Quote FH] Requesting snapshot for " << state.book.symbol() << std::endl;
+    spdlog::info("Requesting snapshot for {}", state.book.symbol());
     
     // Fetch snapshot (blocking)
     SnapshotData snapshot = restClient_.fetchSnapshot(state.book.symbol(), BOOK_DEPTH * 10);
     
     if (!snapshot.success) {
-        std::cerr << "[Quote FH] Snapshot failed: " << snapshot.error << std::endl;
+        spdlog::error("Snapshot failed: {}", snapshot.error);
         state.book.invalidate("Snapshot fetch failed");
         return;
     }
@@ -341,7 +360,7 @@ void QuoteFeedHandler::requestSnapshot(SymbolState& state) {
     // Apply snapshot
     state.book.applySnapshot(snapshot.lastUpdateId, snapshot.bids, snapshot.asks, 0);
     
-    std::cout << "[Quote FH] Applying " << state.deltaBuffer.size() << " buffered deltas" << std::endl;
+    spdlog::debug("Applying {} buffered deltas", state.deltaBuffer.size());
     
     // Apply buffered deltas
     for (const auto& delta : state.deltaBuffer) {
@@ -355,7 +374,7 @@ void QuoteFeedHandler::requestSnapshot(SymbolState& state) {
     state.deltaBuffer.clear();
     
     if (state.book.isValid()) {
-        std::cout << "[Quote FH] Book " << state.book.symbol() << " is now VALID" << std::endl;
+        spdlog::info("Book {} is now VALID", state.book.symbol());
     }
 }
 
@@ -386,7 +405,7 @@ void QuoteFeedHandler::publishInvalid(SymbolState& state, long long fhRecvTimeUt
     publishL1(quote);
     state.publisher.recordPublish(quote);
     
-    std::cout << "[Quote FH] Published INVALID for " << quote.sym << std::endl;
+    spdlog::warn("Published INVALID for {}", quote.sym);
 }
 
 void QuoteFeedHandler::publishL1(const L1Quote& quote) {
@@ -406,9 +425,14 @@ void QuoteFeedHandler::publishL1(const L1Quote& quote) {
     
     K result = k(-tpHandle_, (S)".u.upd", ks((S)"quote_binance"), row, (K)0);
     
+    // Update health: message published
+    lastPubTime_ = std::chrono::system_clock::now();
+    ++msgsPublished_;
+    
     // Check if TP connection died
     if (result == nullptr) {
-        std::cerr << "[Quote FH] TP connection lost, reconnecting...\n";
+        spdlog::error("TP connection lost, reconnecting...");
+        connState_ = "reconnecting";
         kclose(tpHandle_);
         tpHandle_ = -1;
         if (connectToTP()) {
@@ -416,6 +440,42 @@ void QuoteFeedHandler::publishL1(const L1Quote& quote) {
             k(-tpHandle_, (S)".u.upd", ks((S)"quote_binance"), row, (K)0);
         }
     }
+}
+
+void QuoteFeedHandler::publishHealth() {
+    if (tpHandle_ <= 0) return;
+    
+    auto now = std::chrono::system_clock::now();
+    
+    // Calculate uptime
+    long long uptimeSec = std::chrono::duration_cast<std::chrono::seconds>(
+        now - startTime_).count();
+    
+    // Convert timestamps to kdb+ format
+    auto toKdbTs = [](std::chrono::system_clock::time_point tp) -> long long {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            tp.time_since_epoch()).count() - KDB_EPOCH_OFFSET_NS;
+    };
+    
+    // Build health row (10 fields)
+    K row = knk(10,
+        ktj(-KP, toKdbTs(now)),                    // time
+        ks((S)"quote_fh"),                          // handler
+        ktj(-KP, toKdbTs(startTime_)),             // startTimeUtc
+        kj(uptimeSec),                              // uptimeSec
+        kj(msgsReceived_),                          // msgsReceived
+        kj(msgsPublished_),                         // msgsPublished
+        ktj(-KP, toKdbTs(lastMsgTime_)),           // lastMsgTimeUtc
+        ktj(-KP, toKdbTs(lastPubTime_)),           // lastPubTimeUtc
+        ks((S)connState_.c_str()),                  // connState
+        ki(static_cast<int>(symbols_.size()))       // symbolCount
+    );
+    
+    // Publish to TP (fire and forget)
+    k(-tpHandle_, (S)".u.upd", ks((S)"health_feed_handler"), row, (K)0);
+    
+    spdlog::debug("Health published: uptime={}s msgs={}/{} state={}", 
+        uptimeSec, msgsReceived_, msgsPublished_, connState_);
 }
 
 void QuoteFeedHandler::checkPublishTimeouts(long long fhRecvTimeUtcNs) {
@@ -435,15 +495,10 @@ void QuoteFeedHandler::checkPublishTimeouts(long long fhRecvTimeUtcNs) {
 // CONFIGURATION
 // ============================================================================
 
-// Symbols to subscribe to (lowercase for Binance stream names)
-static const std::vector<std::string> SYMBOLS = {
-    "btcusdt",
-    "ethusdt"
-};
+#include "config.hpp"
+#include "logger.hpp"
 
-// Tickerplant connection
-static const std::string TP_HOST = "localhost";
-static const int TP_PORT = 5010;
+static const std::string DEFAULT_CONFIG_PATH = "config/quote_feed_handler.json";
 
 // ============================================================================
 // SIGNAL HANDLING
@@ -455,7 +510,7 @@ static QuoteFeedHandler* g_handler = nullptr;
 static void signalHandler(int signum) {
     const char* sigName = (signum == SIGINT) ? "SIGINT" : 
                           (signum == SIGTERM) ? "SIGTERM" : "UNKNOWN";
-    std::cout << "\n[Quote FH] Received " << sigName << " (" << signum << ")\n";
+    spdlog::info("Received {} ({})", sigName, signum);
     
     if (g_handler) {
         g_handler->stop();
@@ -466,21 +521,43 @@ static void signalHandler(int signum) {
 // MAIN
 // ============================================================================
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "=== Binance Quote Feed Handler ===\n";
+    
+    // Determine config path (from argument or default)
+    std::string configPath = DEFAULT_CONFIG_PATH;
+    if (argc > 1) {
+        configPath = argv[1];
+    }
+    
+    // Load configuration
+    FeedHandlerConfig config;
+    if (!config.load(configPath)) {
+        std::cerr << "Failed to load config, exiting\n";
+        return 1;
+    }
+    
+    if (config.symbols.empty()) {
+        std::cerr << "No symbols configured, exiting\n";
+        return 1;
+    }
+    
+    // Initialize logger
+    initLogger("Quote FH", config.logLevel, config.logFile);
     
     // Install signal handlers
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
-    std::cout << "[Quote FH] Signal handlers installed (Ctrl+C to shutdown)\n";
+    spdlog::info("Signal handlers installed (Ctrl+C to shutdown)");
     
     // Create and run handler
-    QuoteFeedHandler handler(SYMBOLS, TP_HOST, TP_PORT);
+    QuoteFeedHandler handler(config.symbols, config.tpHost, config.tpPort);
     g_handler = &handler;
     
     handler.run();
     
     g_handler = nullptr;
-    std::cout << "[Quote FH] Exiting\n";
+    spdlog::info("Exiting");
+    shutdownLogger();
     return 0;
 }

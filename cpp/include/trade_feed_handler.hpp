@@ -162,6 +162,31 @@ private:
     
     /// Binance reconnection attempt counter
     int binanceReconnectAttempt_{0};
+    
+    // ========================================================================
+    // HEALTH TRACKING
+    // ========================================================================
+    
+    /// Handler start time (for uptime calculation)
+    std::chrono::system_clock::time_point startTime_;
+    
+    /// Total messages received from Binance
+    long long msgsReceived_{0};
+    
+    /// Total messages published to TP
+    long long msgsPublished_{0};
+    
+    /// Time of last message received
+    std::chrono::system_clock::time_point lastMsgTime_;
+    
+    /// Time of last publish to TP
+    std::chrono::system_clock::time_point lastPubTime_;
+    
+    /// Current connection state
+    std::string connState_{"disconnected"};
+    
+    /// Health publish interval in seconds
+    static constexpr int HEALTH_INTERVAL_SEC = 5;
 
     // ========================================================================
     // PRIVATE METHODS
@@ -206,6 +231,13 @@ private:
      * Called by run() inside the reconnection loop.
      */
     void runWebSocketLoop();
+    
+    /**
+     * @brief Publish health metrics to TP
+     * 
+     * Called periodically to report handler health status.
+     */
+    void publishHealth();
 };
 
 #endif // TRADE_FEED_HANDLER_HPP

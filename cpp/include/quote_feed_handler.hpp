@@ -188,6 +188,31 @@ private:
     
     /// REST client for snapshots
     RestClient restClient_;
+    
+    // ========================================================================
+    // HEALTH TRACKING
+    // ========================================================================
+    
+    /// Handler start time (for uptime calculation)
+    std::chrono::system_clock::time_point startTime_;
+    
+    /// Total messages received from Binance
+    long long msgsReceived_{0};
+    
+    /// Total messages published to TP
+    long long msgsPublished_{0};
+    
+    /// Time of last message received
+    std::chrono::system_clock::time_point lastMsgTime_;
+    
+    /// Time of last publish to TP
+    std::chrono::system_clock::time_point lastPubTime_;
+    
+    /// Current connection state
+    std::string connState_{"disconnected"};
+    
+    /// Health publish interval in seconds
+    static constexpr int HEALTH_INTERVAL_SEC = 5;
 
     // ========================================================================
     // PRIVATE METHODS
@@ -228,6 +253,9 @@ private:
     
     /// Run the WebSocket connection loop
     void runWebSocketLoop();
+    
+    /// Publish health metrics to TP
+    void publishHealth();
 };
 
 #endif // QUOTE_FEED_HANDLER_HPP

@@ -6,6 +6,7 @@
 #include "trade_feed_handler.hpp"
 
 #include <rapidjson/document.h>
+#include <spdlog/spdlog.h>
 
 #include <iostream>
 #include <chrono>
@@ -22,13 +23,14 @@ TradeFeedHandler::TradeFeedHandler(const std::vector<std::string>& symbols,
     : symbols_(symbols)
     , tpHost_(tpHost)
     , tpPort_(tpPort)
+    , startTime_(std::chrono::system_clock::now())
 {
 }
 
 TradeFeedHandler::~TradeFeedHandler() {
     if (tpHandle_ > 0) {
         kclose(tpHandle_);
-        std::cout << "[Trade FH] TP connection closed in destructor\n";
+        spdlog::debug("TP connection closed in destructor");
     }
 }
 
@@ -37,14 +39,12 @@ TradeFeedHandler::~TradeFeedHandler() {
 // ============================================================================
 
 void TradeFeedHandler::run() {
-    std::cout << "[Trade FH] Starting...\n";
-    std::cout << "[Trade FH] Symbols: ";
-    for (const auto& s : symbols_) std::cout << s << " ";
-    std::cout << "\n";
+    spdlog::info("Starting...");
+    spdlog::info("Symbols: {}", fmt::join(symbols_, " "));
     
     // Connect to tickerplant (retries until success or shutdown)
     if (!connectToTP()) {
-        std::cout << "[Trade FH] Shutdown before TP connection established\n";
+        spdlog::warn("Shutdown before TP connection established");
         return;
     }
     
@@ -54,10 +54,10 @@ void TradeFeedHandler::run() {
             runWebSocketLoop();
         } catch (const std::exception& e) {
             if (!running_) {
-                std::cout << "[Trade FH] Connection closed during shutdown\n";
+                spdlog::info("Connection closed during shutdown");
             } else {
-                std::cerr << "[Trade FH] Binance error: " << e.what() << "\n";
-                std::cerr << "[Trade FH] Will reconnect...\n";
+                spdlog::error("Binance error: {}", e.what());
+                spdlog::info("Will reconnect...");
                 if (!sleepWithBackoff(binanceReconnectAttempt_++)) {
                     break;  // Shutdown requested during backoff
                 }
@@ -66,18 +66,18 @@ void TradeFeedHandler::run() {
     }
     
     // Cleanup
-    std::cout << "[Trade FH] Cleaning up...\n";
+    spdlog::info("Cleaning up...");
     if (tpHandle_ > 0) {
         kclose(tpHandle_);
         tpHandle_ = -1;
-        std::cout << "[Trade FH] TP connection closed\n";
+        spdlog::info("TP connection closed");
     }
     
-    std::cout << "[Trade FH] Shutdown complete (processed " << fhSeqNo_ << " messages)\n";
+    spdlog::info("Shutdown complete (processed {} messages)", fhSeqNo_);
 }
 
 void TradeFeedHandler::stop() {
-    std::cout << "[Trade FH] Stop requested\n";
+    spdlog::info("Stop requested");
     running_ = false;
 }
 
@@ -97,17 +97,17 @@ std::string TradeFeedHandler::buildStreamPath() const {
 bool TradeFeedHandler::connectToTP() {
     int attempt = 0;
     while (running_) {
-        std::cout << "[Trade FH] Connecting to TP on " << tpHost_ << ":" << tpPort_ << "...\n";
+        spdlog::info("Connecting to TP on {}:{}...", tpHost_, tpPort_);
         
         int h = khpu((S)tpHost_.c_str(), tpPort_, (S)"");
         
         if (h > 0) {
             tpHandle_ = h;
-            std::cout << "[Trade FH] Connected to TP (handle " << h << ")\n";
+            spdlog::info("Connected to TP (handle {})", h);
             return true;
         }
         
-        std::cerr << "[Trade FH] Failed to connect to TP\n";
+        spdlog::error("Failed to connect to TP");
         if (!sleepWithBackoff(attempt++)) {
             return false;  // Shutdown requested
         }
@@ -122,7 +122,7 @@ bool TradeFeedHandler::sleepWithBackoff(int attempt) {
     }
     delay = std::min(delay, MAX_BACKOFF_MS);
     
-    std::cout << "[Trade FH] Waiting " << delay << "ms before reconnect...\n";
+    spdlog::info("Waiting {}ms before reconnect...", delay);
     
     // Sleep in small increments to allow quick shutdown response
     const int checkIntervalMs = 100;
@@ -142,17 +142,12 @@ void TradeFeedHandler::validateTradeId(const std::string& sym, long long tradeId
         long long last = it->second;
         
         if (tradeId < last) {
-            std::cerr << "[Trade FH] OUT OF ORDER: " << sym 
-                      << " last=" << last 
-                      << " got=" << tradeId << std::endl;
+            spdlog::warn("OUT OF ORDER: {} last={} got={}", sym, last, tradeId);
         } else if (tradeId == last) {
-            std::cerr << "[Trade FH] DUPLICATE: " << sym 
-                      << " tradeId=" << tradeId << std::endl;
+            spdlog::warn("DUPLICATE: {} tradeId={}", sym, tradeId);
         } else if (tradeId > last + 1) {
             long long missed = tradeId - last - 1;
-            std::cout << "[Trade FH] Gap: " << sym 
-                      << " missed=" << missed 
-                      << " (last=" << last << " got=" << tradeId << ")" << std::endl;
+            spdlog::warn("Gap: {} missed={} (last={} got={})", sym, missed, last, tradeId);
         }
     }
     
@@ -165,6 +160,10 @@ void TradeFeedHandler::processMessage(const std::string& msg) {
     long long fhRecvTimeUtcNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             recvWall.time_since_epoch()).count();
+    
+    // Update health: message received
+    lastMsgTime_ = recvWall;
+    ++msgsReceived_;
     
     // Start monotonic timer for parse latency
     auto parseStart = std::chrono::steady_clock::now();
@@ -223,23 +222,21 @@ void TradeFeedHandler::processMessage(const std::string& msg) {
         sendEnd - parseEnd).count();
     kK(row)[10]->j = fhSendUs;
     
-    // Console output
-    std::cout
-        << "sym=" << sym
-        << " tradeId=" << tradeId
-        << " price=" << price
-        << " qty=" << qty
-        << " fhParseUs=" << fhParseUs
-        << " fhSendUs=" << fhSendUs
-        << " fhSeqNo=" << fhSeqNo_
-        << std::endl;
+    // Debug output (only shown at debug level)
+    spdlog::debug("Trade: sym={} tradeId={} price={:.2f} qty={:.4f} fhParseUs={} fhSendUs={} fhSeqNo={}",
+        sym, tradeId, price, qty, fhParseUs, fhSendUs, fhSeqNo_);
     
     // Publish to TP
     K result = k(-tpHandle_, (S)".u.upd", ks((S)"trade_binance"), row, (K)0);
     
+    // Update health: message published
+    lastPubTime_ = std::chrono::system_clock::now();
+    ++msgsPublished_;
+    
     // Check if TP connection died
     if (result == nullptr) {
-        std::cerr << "[Trade FH] TP connection lost, reconnecting...\n";
+        spdlog::error("TP connection lost, reconnecting...");
+        connState_ = "reconnecting";
         kclose(tpHandle_);
         tpHandle_ = -1;
         if (connectToTP()) {
@@ -251,7 +248,9 @@ void TradeFeedHandler::processMessage(const std::string& msg) {
 
 void TradeFeedHandler::runWebSocketLoop() {
     std::string target = buildStreamPath();
-    std::cout << "[Trade FH] Connecting to Binance: " << BINANCE_HOST << target << "\n";
+    spdlog::info("Connecting to Binance: {}{}", BINANCE_HOST, target);
+    
+    connState_ = "connecting";
     
     // Initialize ASIO and SSL
     net::io_context ioc;
@@ -271,10 +270,14 @@ void TradeFeedHandler::runWebSocketLoop() {
     // WebSocket handshake
     ws.handshake(BINANCE_HOST, target);
     
-    std::cout << "[Trade FH] Connected to Binance (" << symbols_.size() << " symbols)\n";
+    spdlog::info("Connected to Binance ({} symbols)", symbols_.size());
+    connState_ = "connected";
     
     // Reset backoff on successful connection
     binanceReconnectAttempt_ = 0;
+    
+    // Health publish timer
+    auto lastHealthPub = std::chrono::steady_clock::now();
     
     // Message loop
     while (running_) {
@@ -285,32 +288,72 @@ void TradeFeedHandler::runWebSocketLoop() {
         
         std::string msg = beast::buffers_to_string(buffer.data());
         processMessage(msg);
+        
+        // Publish health every HEALTH_INTERVAL_SEC seconds
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastHealthPub).count() >= HEALTH_INTERVAL_SEC) {
+            publishHealth();
+            lastHealthPub = now;
+        }
     }
+    
+    connState_ = "disconnected";
     
     // Graceful close
     if (!running_) {
         try {
             ws.close(websocket::close_code::normal);
-            std::cout << "[Trade FH] WebSocket closed gracefully\n";
+            spdlog::info("WebSocket closed gracefully");
         } catch (...) {
             // Ignore errors during shutdown
         }
     }
 }
 
+void TradeFeedHandler::publishHealth() {
+    if (tpHandle_ <= 0) return;
+    
+    auto now = std::chrono::system_clock::now();
+    
+    // Calculate uptime
+    long long uptimeSec = std::chrono::duration_cast<std::chrono::seconds>(
+        now - startTime_).count();
+    
+    // Convert timestamps to kdb+ format
+    auto toKdbTs = [](std::chrono::system_clock::time_point tp) -> long long {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            tp.time_since_epoch()).count() - KDB_EPOCH_OFFSET_NS;
+    };
+    
+    // Build health row (10 fields)
+    K row = knk(10,
+        ktj(-KP, toKdbTs(now)),                    // time
+        ks((S)"trade_fh"),                          // handler
+        ktj(-KP, toKdbTs(startTime_)),             // startTimeUtc
+        kj(uptimeSec),                              // uptimeSec
+        kj(msgsReceived_),                          // msgsReceived
+        kj(msgsPublished_),                         // msgsPublished
+        ktj(-KP, toKdbTs(lastMsgTime_)),           // lastMsgTimeUtc
+        ktj(-KP, toKdbTs(lastPubTime_)),           // lastPubTimeUtc
+        ks((S)connState_.c_str()),                  // connState
+        ki(static_cast<int>(symbols_.size()))       // symbolCount
+    );
+    
+    // Publish to TP (fire and forget)
+    k(-tpHandle_, (S)".u.upd", ks((S)"health_feed_handler"), row, (K)0);
+    
+    spdlog::debug("Health published: uptime={}s msgs={}/{} state={}", 
+        uptimeSec, msgsReceived_, msgsPublished_, connState_);
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-// Symbols to subscribe to (lowercase for Binance stream names)
-static const std::vector<std::string> SYMBOLS = {
-    "btcusdt",
-    "ethusdt"
-};
+#include "config.hpp"
+#include "logger.hpp"
 
-// Tickerplant connection
-static const std::string TP_HOST = "localhost";
-static const int TP_PORT = 5010;
+static const std::string DEFAULT_CONFIG_PATH = "config/trade_feed_handler.json";
 
 // ============================================================================
 // SIGNAL HANDLING
@@ -322,7 +365,7 @@ static TradeFeedHandler* g_handler = nullptr;
 static void signalHandler(int signum) {
     const char* sigName = (signum == SIGINT) ? "SIGINT" : 
                           (signum == SIGTERM) ? "SIGTERM" : "UNKNOWN";
-    std::cout << "\n[Trade FH] Received " << sigName << " (" << signum << ")\n";
+    spdlog::info("Received {} ({})", sigName, signum);
     
     if (g_handler) {
         g_handler->stop();
@@ -333,21 +376,43 @@ static void signalHandler(int signum) {
 // MAIN
 // ============================================================================
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "=== Binance Trade Feed Handler ===\n";
+    
+    // Determine config path (from argument or default)
+    std::string configPath = DEFAULT_CONFIG_PATH;
+    if (argc > 1) {
+        configPath = argv[1];
+    }
+    
+    // Load configuration
+    FeedHandlerConfig config;
+    if (!config.load(configPath)) {
+        std::cerr << "Failed to load config, exiting\n";
+        return 1;
+    }
+    
+    if (config.symbols.empty()) {
+        std::cerr << "No symbols configured, exiting\n";
+        return 1;
+    }
+    
+    // Initialize logger
+    initLogger("Trade FH", config.logLevel, config.logFile);
     
     // Install signal handlers
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
-    std::cout << "[Trade FH] Signal handlers installed (Ctrl+C to shutdown)\n";
+    spdlog::info("Signal handlers installed (Ctrl+C to shutdown)");
     
     // Create and run handler
-    TradeFeedHandler handler(SYMBOLS, TP_HOST, TP_PORT);
+    TradeFeedHandler handler(config.symbols, config.tpHost, config.tpPort);
     g_handler = &handler;
     
     handler.run();
     
     g_handler = nullptr;
-    std::cout << "[Trade FH] Exiting\n";
+    spdlog::info("Exiting");
+    shutdownLogger();
     return 0;
 }

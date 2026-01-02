@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
+find_package(spdlog REQUIRED)
 
 # Include directories
 set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/cpp/include)
@@ -21,6 +22,7 @@ set(COMMON_LIBS
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
+    spdlog::spdlog
 )
 
 # Trade feed handler
