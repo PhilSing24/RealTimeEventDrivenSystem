@@ -1,33 +1,36 @@
 # ADR-008: Error Handling Strategy
 
 ## Status
-Accepted
+Accepted (Updated 2025-12-29)
 
 ## Date
-2025-12-18
+2025-12-18 (Updated 2025-12-29)
 
 ## Context
 
 The system consists of multiple components communicating via network:
 
 ```
-Binance ──WebSocket──► FH ──IPC──► TP ──IPC──► RDB
-                                       ──IPC──► RTE
+Binance Trade Stream ──WebSocket──► Trade FH ──┬──IPC──► TP ──IPC──► RDB
+                                               │              ──IPC──► RTE
+Binance Depth Stream ──WebSocket──► Quote FH ──┘
+         ▲
+         └──REST── (snapshot)
 ```
 
 Each component can experience failures:
 
 | Component | Potential Failures |
 |-----------|-------------------|
-| Feed Handler | WebSocket disconnect, JSON parse error, IPC failure |
+| Trade FH | WebSocket disconnect, JSON parse error, IPC failure |
+| Quote FH | WebSocket disconnect, REST failure, sequence gap, IPC failure |
 | Tickerplant | Subscriber disconnect, invalid message, publish failure |
 | RDB | TP connection loss, timer error, query error |
 | RTE | TP connection loss, computation error |
 
 The project is explicitly exploratory (ADR-003, ADR-006):
-- No durability requirements
-- No recovery mechanisms
-- Data loss is acceptable
+- TP logging provides durability
+- Manual replay provides recovery
 - Focus is on understanding real-time behaviour
 
 A decision is required on how errors are handled across the system.
@@ -53,8 +56,19 @@ The system adopts a **fail-fast with logging** error handling strategy appropria
 | Fail fast | Surface problems immediately; don't hide failures |
 | Log clearly | Make failures visible and diagnosable |
 | Don't retry silently | Retries can mask problems; prefer explicit restart |
-| Accept data loss | Consistent with ADR-003 and ADR-006 |
+| Independent restart | Each process can be restarted without affecting others |
 | Keep it simple | Avoid complex retry/recovery logic |
+
+### Restart vs Reconnection
+
+These are distinct concepts:
+
+| Concept | Meaning | Status |
+|---------|---------|--------|
+| **Independent restart** | Can restart one process without restarting others | ✓ Supported |
+| **Auto-reconnection** | Process automatically reconnects after connection loss | Minimal |
+
+Independent restart is a benefit of the separate-process architecture (ADR-002). Auto-reconnection is a separate feature that requires additional implementation.
 
 ### Error Categories
 
@@ -65,11 +79,12 @@ Errors are categorised by severity and response:
 | **Fatal** | Cannot connect to upstream, config error | Log and exit |
 | **Connection** | Lost connection to peer | Log and attempt reconnect |
 | **Transient** | Parse error, invalid message | Log and skip message |
+| **Recoverable** | Sequence gap, book invalid | Log, enter recovery state |
 | **Silent** | Expected disconnects | Handle gracefully |
 
 ### Per-Component Strategy
 
-#### Feed Handler (C++)
+#### Trade Feed Handler (C++)
 
 | Error | Category | Handling |
 |-------|----------|----------|
@@ -80,6 +95,28 @@ Errors are categorised by severity and response:
 | JSON parse error | Transient | Log warning, skip message |
 | Missing required field | Transient | Log warning, skip message |
 | IPC send failure | Transient | Log warning, continue |
+
+#### Quote Feed Handler (C++)
+
+| Error | Category | Handling |
+|-------|----------|----------|
+| Cannot connect to Binance | Fatal | Log, exit with error code |
+| Cannot connect to TP | Fatal | Log, exit with error code |
+| WebSocket disconnect (Binance) | Connection | Log, reconnect, re-sync book |
+| TP connection lost | Connection | Log, reconnect with backoff |
+| REST snapshot failure | Recoverable | Log, retry with backoff |
+| Sequence gap detected | Recoverable | Log, transition to INVALID, re-sync |
+| Book in INVALID state | Recoverable | Publish invalid quote, attempt re-sync |
+| JSON parse error | Transient | Log warning, skip message |
+| IPC send failure | Transient | Log warning, continue |
+
+**Quote handler state transitions on error:**
+
+```
+VALID ──sequence gap──► INVALID ──re-sync──► SYNCING ──► VALID
+                            │
+                            └──publish invalid quote (once)
+```
 
 **Reconnection backoff:**
 
@@ -94,6 +131,7 @@ Errors are categorised by severity and response:
 - Basic error handling exists
 - Reconnection logic: minimal (needs enhancement)
 - JSON errors: logged, message skipped
+- Quote handler: sequence validation and state machine implemented
 
 #### Tickerplant (q)
 
@@ -103,6 +141,7 @@ Errors are categorised by severity and response:
 | Subscriber disconnect | Silent | Remove from `.u.w` via `.z.pc` |
 | Publish to dead handle | Transient | Caught by `.z.pc`, handle removed |
 | Malformed message | Transient | Let q signal error (logged) |
+| Log write failure | Transient | Log error, continue publishing |
 
 **Implementation:**
 ```q
@@ -131,7 +170,7 @@ Errors are categorised by severity and response:
   ...
   };
 
-/ Timer with error protection (recommended enhancement)
+/ Timer with error protection
 .z.ts:{@[.rdb.computeTelemetry; ::; {-1 "Telemetry error: ",x}]};
 ```
 
@@ -172,9 +211,10 @@ if[not s in key .rte.buffer; .rte.initBuffer[s]];
 
 Example:
 ```
-[ERROR] [FH] [2025-12-18T10:30:45Z] WebSocket disconnected from Binance
-[INFO] [TP] [2025-12-18T10:30:46Z] Subscriber connected: handle 5
-[WARN] [RDB] [2025-12-18T10:30:47Z] Telemetry bucket empty, skipping
+[ERROR] [TRADE_FH] [2025-12-29T10:30:45Z] WebSocket disconnected from Binance
+[WARN] [QUOTE_FH] [2025-12-29T10:30:46Z] Sequence gap detected, BTCUSDT transitioning to INVALID
+[INFO] [TP] [2025-12-29T10:30:47Z] Subscriber connected: handle 5
+[INFO] [QUOTE_FH] [2025-12-29T10:30:48Z] BTCUSDT transitioning to VALID
 ```
 
 ### What Is NOT Handled
@@ -184,8 +224,8 @@ Consistent with the exploratory nature:
 | Scenario | Status | Rationale |
 |----------|--------|-----------|
 | Automatic TP reconnect in RDB/RTE | Not implemented | Manual restart acceptable |
-| Message replay after gap | Not implemented | ADR-006 |
-| Persistent error logs | Not implemented | ADR-003 ephemeral stance |
+| Automatic recovery on startup | Not implemented | Manual replay via `replay.q` |
+| Persistent error logs | Not implemented | Console output sufficient |
 | Alerting | Not implemented | Human observation via dashboard |
 | Circuit breakers | Not implemented | Overkill for 2 symbols |
 | Dead letter queues | Not implemented | Dropped messages acceptable |
@@ -199,6 +239,7 @@ Errors are made visible through:
 | Console output | Immediate visibility during development |
 | Dashboard staleness | `isValid`, `fillPct` indicate data quality |
 | Gap detection | `fhSeqNo` gaps observable in RDB |
+| Quote validity | `isValid` in `quote_binance` indicates book state |
 | Process exit | Fatal errors surface immediately |
 
 ### Startup Validation
@@ -207,8 +248,9 @@ Each component validates its environment at startup:
 
 | Component | Validation |
 |-----------|------------|
-| FH | Can resolve Binance host, can connect to TP |
-| TP | Port available, schema valid |
+| Trade FH | Can resolve Binance host, can connect to TP |
+| Quote FH | Can resolve Binance host, can connect to TP, REST endpoint reachable |
+| TP | Port available, schema valid, log directory writable |
 | RDB | Can connect to TP, subscription succeeds |
 | RTE | Can connect to TP, subscription succeeds |
 
@@ -220,9 +262,10 @@ This approach was selected because:
 
 - **Simplicity**: Complex retry logic adds code and hides problems
 - **Visibility**: Fail-fast surfaces issues immediately
-- **Consistency**: Aligns with ADR-003 (ephemeral) and ADR-006 (no recovery)
+- **Consistency**: Aligns with ADR-003 (logging) and ADR-006 (manual replay)
 - **Appropriate**: Error handling matches project maturity
 - **Debuggable**: Clear logs aid understanding
+- **Independent**: Each process handles its own errors
 
 ## Alternatives Considered
 
@@ -260,6 +303,12 @@ Rejected:
 - FH and TP are trusted components
 - Validation overhead not justified
 
+### 6. Shared error handling library
+Rejected:
+- Overkill for current scale
+- Each component has different error scenarios
+- Would add coupling between components
+
 ## Consequences
 
 ### Positive
@@ -268,13 +317,15 @@ Rejected:
 - Problems surface immediately (fail fast)
 - Easy to diagnose issues via logs
 - No hidden retry loops masking problems
-- Consistent with ephemeral data stance
+- Quote handler state machine handles recovery scenarios
+- Independent processes can be restarted independently
 - Low implementation overhead
 
 ### Negative / Trade-offs
 
 - Manual restart required for some failures
 - No automatic recovery from TP disconnect (RDB/RTE)
+- No automatic recovery on startup (manual replay required)
 - Transient errors cause data loss (by design)
 - No persistent audit trail of errors
 - Log format is informal (no structured logging)
@@ -285,26 +336,33 @@ These trade-offs are acceptable for the current phase.
 
 ### Implemented
 
-- [x] FH: Exit on startup connection failure
-- [x] FH: Skip malformed JSON messages
+- [x] Trade FH: Exit on startup connection failure
+- [x] Trade FH: Skip malformed JSON messages
+- [x] Quote FH: Exit on startup connection failure
+- [x] Quote FH: Sequence gap detection and INVALID state
+- [x] Quote FH: State machine (INIT → SYNCING → VALID ↔ INVALID)
 - [x] TP: `.z.pc` handles subscriber disconnect
 - [x] TP: `.u.sub` validates table name
+- [x] TP: Logging to separate files per data type
 - [x] RDB: Protected TP connection with error message
 - [x] RTE: Protected TP connection with error message
 - [x] RTE: Auto-initialize unknown symbols
+- [x] RTE: Standalone mode for testing
 
 ### Recommended Enhancements
 
-- [ ] FH: Reconnect to Binance with backoff
-- [ ] FH: Reconnect to TP with backoff
-- [ ] FH: Log with consistent format and levels
+- [ ] Trade FH: Reconnect to Binance with backoff
+- [ ] Trade FH: Reconnect to TP with backoff
+- [ ] Quote FH: Reconnect to Binance with backoff
+- [ ] Quote FH: Reconnect to TP with backoff
+- [ ] All FH: Log with consistent format and levels
 - [ ] RDB: Protected timer callback
 - [ ] RDB: Log telemetry errors
-- [ ] All: Consistent log format across components
 
 ### Out of Scope
 
 - [ ] Automatic RDB/RTE reconnect to TP
+- [ ] Automatic recovery on startup
 - [ ] Structured logging
 - [ ] External log aggregation
 - [ ] Alerting
@@ -315,6 +373,7 @@ These trade-offs are acceptable for the current phase.
 | Enhancement | Trigger |
 |-------------|---------|
 | Automatic reconnection | Frequent manual restarts become painful |
+| Automatic startup recovery | Production deployment |
 | Structured logging | Need for log analysis or aggregation |
 | Health endpoints | External monitoring integration |
 | Alerting | Production deployment |
@@ -324,7 +383,9 @@ These trade-offs are acceptable for the current phase.
 
 - `../kdbx-real-time-architecture-reference.md` (fail-fast principle)
 - `adr-001-timestamps-and-latency-measurement.md` (fhSeqNo for gap detection)
-- `adr-003-tickerplant-logging-and-durability-strategy.md` (ephemeral stance)
+- `adr-002-feed-handler-to-kdb-ingestion-path.md` (separate processes, independent restart)
+- `adr-003-tickerplant-logging-and-durability-strategy.md` (TP logging)
 - `adr-004-real-time-rolling-analytics-computation.md` (validity indicators)
-- `adr-006-recovery-and-replay-strategy.md` (no recovery)
+- `adr-006-recovery-and-replay-strategy.md` (manual replay)
 - `adr-007-visualisation-and-consumption-strategy.md` (observability via dashboard)
+- `adr-009-l1-order-book-architecture.md` (quote handler state machine)

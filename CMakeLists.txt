@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(binance_feed_handler LANGUAGES CXX)
+project(binance_feed_handlers LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,44 +14,40 @@ find_package(Boost REQUIRED COMPONENTS system)
 set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/cpp/include)
 set(KDB_DIR ${PROJECT_SOURCE_DIR}/cpp/third_party/kdb)
 
-# Trade feed handler
-add_executable(binance_feed_handler
-    cpp/src/main.cpp
-    cpp/src/feed_handler.cpp
-)
-
-target_include_directories(binance_feed_handler PRIVATE
-    ${INCLUDE_DIR}
-    ${KDB_DIR}
-)
-
-target_link_libraries(binance_feed_handler
+# Common libraries for both handlers
+set(COMMON_LIBS
     ${KDB_DIR}/c.o
     Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
 )
+
+# Trade feed handler
+add_executable(trade_feed_handler
+    cpp/src/trade_feed_handler.cpp
+)
+
+target_include_directories(trade_feed_handler PRIVATE
+    ${INCLUDE_DIR}
+    ${KDB_DIR}
+)
+
+target_link_libraries(trade_feed_handler ${COMMON_LIBS})
 
 # Quote feed handler
-add_executable(binance_quote_handler
-    cpp/src/quote_handler_main.cpp
+add_executable(quote_feed_handler
+    cpp/src/quote_feed_handler.cpp
 )
 
-target_include_directories(binance_quote_handler PRIVATE
+target_include_directories(quote_feed_handler PRIVATE
     ${INCLUDE_DIR}
     ${KDB_DIR}
 )
 
-target_link_libraries(binance_quote_handler
-    ${KDB_DIR}/c.o
-    Boost::system
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    Threads::Threads
-)
+target_link_libraries(quote_feed_handler ${COMMON_LIBS})
 
-# Snapshot test
+# Snapshot test utility
 add_executable(test_snapshot
     cpp/src/test_snapshot.cpp
 )
