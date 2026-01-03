@@ -1,10 +1,10 @@
 # ADR-005: Telemetry and Metrics Aggregation Strategy
 
 ## Status
-Accepted (Updated 2025-12-19)
+Accepted (Updated 2026-01-02)
 
 ## Date
-2025-12-17 (Updated 2025-12-19)
+2025-12-17 (Updated 2026-01-02)
 
 ## Context
 
@@ -46,6 +46,7 @@ Telemetry will be collected as **raw per-event measurements** and **aggregated i
 | Pipeline latencies | `fh_to_tp_ms`, `tp_to_rdb_ms`, `e2e_system_ms` | Derived from wall-clock timestamps (via RDB) |
 | Throughput | Events per second, per symbol | Computed from event counts (via RDB) |
 | Analytics health | `isValid`, `fillPct`, `tradeCount5m` | Queried from RTE |
+| FH health | `uptimeSec`, `msgsReceived`, `connState` | Published directly by FH every 5 seconds |
 
 ### Aggregation Location
 
@@ -172,6 +173,50 @@ The TEL process runs a 5-second timer that:
 | `fillPct` | float | RTE window fill percentage |
 | `tradeCount5m` | long | Trades in RTE rolling window |
 | `avgPrice5m` | float | Average price in RTE rolling window |
+
+### Feed Handler Health Metrics
+
+Health metrics are published directly by each feed handler (not aggregated by TEL). They provide process-level visibility independent of market data flow.
+
+**Health metrics (`health_feed_handler`):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `time` | timestamp | Time health was published |
+| `handler` | symbol | Handler identifier (`trade_fh`, `quote_fh`) |
+| `startTimeUtc` | timestamp | When handler process started |
+| `uptimeSec` | long | Seconds since process start |
+| `msgsReceived` | long | Total messages received from Binance |
+| `msgsPublished` | long | Total messages published to TP |
+| `lastMsgTimeUtc` | timestamp | Time of last received message |
+| `lastPubTimeUtc` | timestamp | Time of last publish to TP |
+| `connState` | symbol | Connection state (`connected`, `reconnecting`, `disconnected`) |
+| `symbolCount` | int | Number of subscribed symbols |
+
+**Publication frequency:** Every 5 seconds per handler
+
+**Key differences from telemetry tables:**
+- Published by FH directly to TP (not computed by TEL)
+- Point-in-time snapshots (not aggregated from events)
+- Stored in TP and RDB (not TEL)
+- No TP/RDB timestamp added (health rows pass through unchanged)
+
+**Example queries:**
+```q
+/ Latest status per handler
+select last time, last uptimeSec, last msgsReceived, last connState 
+  by handler from health_feed_handler
+
+/ Detect stale handlers (no update in 15 seconds)
+select from health_feed_handler 
+  where time = (max;time) fby handler, 
+        time < .z.p - 00:00:15
+
+/ Detect recent restarts (uptime < 60 seconds)
+select from health_feed_handler
+  where time = (max;time) fby handler,
+        uptimeSec < 60
+```
 
 ### Monitoring Approach
 

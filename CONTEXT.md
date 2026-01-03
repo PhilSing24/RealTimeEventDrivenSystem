@@ -1,6 +1,6 @@
 # CONTEXT.md - Project Status for Claude Sessions
 
-*Last updated: 2025-12-29*
+*Last updated: 2026-01-02*
 
 ## Project Overview
 
@@ -8,25 +8,27 @@ Real-time Binance market data → C++ Feed Handlers → kdb+ pipeline (TP → RD
 
 ## Architecture
 ```
-Binance WebSocket ──► Trade FH (C++) ──┬──► TP:5010 ──┬──► RDB:5011 (trade storage)
+Binance WebSocket ──► Trade FH (C++) ──┬──► TP:5010 ──┬──► RDB:5011 (storage + health)
                                        │              │
-Binance WebSocket ──► Quote FH (C++) ──┘              ├──► RTE:5012 (rolling analytics)
-                                                      │
-                                                      └──► Log files
-                                                           ├── trade.log
-                                                           └── quote.log
+Binance WebSocket ──► Quote FH (C++) ──┘              └──► RTE:5012 (rolling analytics)
+                                                      
+Log files: logs/*.trade.log, logs/*.quote.log
+```
 
 ## Component Status
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `cpp/src/feed_handler.cpp` | Trade WebSocket client, JSON parse, IPC publish | ✓ Complete |
-| `cpp/src/quote_handler_main.cpp` | Quote handler entry point | ✓ Complete |
-| `cpp/include/quote_handler.hpp` | Depth WebSocket, snapshot reconciliation | ✓ Complete |
+| `cpp/src/trade_feed_handler.cpp` | Trade WebSocket, JSON parse, IPC publish | ✓ Complete |
+| `cpp/src/quote_feed_handler.cpp` | Quote handler with snapshot reconciliation | ✓ Complete |
+| `cpp/include/trade_feed_handler.hpp` | Trade handler class definition | ✓ Complete |
+| `cpp/include/quote_feed_handler.hpp` | Quote handler class definition | ✓ Complete |
 | `cpp/include/order_book.hpp` | OrderBook state machine, L1Publisher | ✓ Complete |
 | `cpp/include/rest_client.hpp` | REST snapshot client | ✓ Complete |
-| `kdb/tp.q` | Tickerplant with pub/sub and separate logging | ✓ Complete |
-| `kdb/rdb.q` | Trade storage (subscribes to trade_binance only) | ✓ Complete |
+| `cpp/include/config.hpp` | JSON config loader | ✓ Complete |
+| `cpp/include/logger.hpp` | spdlog wrapper | ✓ Complete |
+| `kdb/tp.q` | Tickerplant with pub/sub and logging | ✓ Complete |
+| `kdb/rdb.q` | Storage for trades, quotes, health | ✓ Complete |
 | `kdb/rte.q` | Rolling analytics (5-min window) | ✓ Complete |
 | `kdb/replay.q` | Log replay tool | ✓ Complete |
 
@@ -35,29 +37,29 @@ Binance WebSocket ──► Quote FH (C++) ──┘              ├──► R
 binance_feed_handler/
 ├── cpp/
 │   ├── include/
+│   │   ├── trade_feed_handler.hpp
+│   │   ├── quote_feed_handler.hpp
 │   │   ├── order_book.hpp
 │   │   ├── rest_client.hpp
-│   │   └── quote_handler.hpp
+│   │   ├── config.hpp
+│   │   └── logger.hpp
 │   ├── src/
-│   │   ├── main.cpp
-│   │   ├── feed_handler.cpp
-│   │   ├── quote_handler_main.cpp
-│   │   └── test_snapshot.cpp
+│   │   ├── trade_feed_handler.cpp
+│   │   └── quote_feed_handler.cpp
 │   └── third_party/kdb/
 │       ├── k.h
 │       └── c.o
+├── config/
+│   ├── trade_feed_handler.json
+│   └── quote_feed_handler.json
 ├── kdb/
 │   ├── tp.q
 │   ├── rdb.q
 │   ├── rte.q
 │   └── replay.q
-├── docs/
-│   └── decisions/
-│       ├── adr-001 to adr-008
-│       └── adr-009-L1-Order-Book-Architecture.md
+├── docs/decisions/
+│   └── adr-001 to adr-009
 ├── logs/
-│   ├── YYYY.MM.DD.trade.log
-│   └── YYYY.MM.DD.quote.log
 ├── CMakeLists.txt
 ├── start.sh
 └── stop.sh
@@ -65,108 +67,88 @@ binance_feed_handler/
 
 ## Recent Changes
 
+- **2026-01-02**: Production hardening complete
+  - JSON configuration files (`config/*.json`)
+  - Structured logging via spdlog
+  - Health metrics published every 5 seconds
+  - `health_feed_handler` table in TP/RDB
+  - Automatic reconnection with exponential backoff
+  - Graceful shutdown on SIGINT/SIGTERM
+  - Class-based architecture for feed handlers
+
 - **2025-12-29**: Added L1 Order Book (Quote Handler)
   - Separate process for depth stream ingestion
   - OrderBook state machine (INIT/SYNCING/VALID/INVALID)
-  - REST snapshot + delta reconciliation per Binance spec
+  - REST snapshot + delta reconciliation
   - L1 publication on change or 50ms timeout
-  - ADR-009 documents architecture
-- **2025-12-29**: Separate log files
-  - `trade.log` for trades
-  - `quote.log` for quotes
-  - Updated ADR-003
-- **2025-12-29**: Project restructure
-  - C++ code moved to `cpp/` directory
-  - Headers in `cpp/include/`, sources in `cpp/src/`
+
 - **2025-12-24**: Added TP logging and replay tool
-  - TP writes binary logs to `logs/` (daily rotation)
-  - `replay.q` replays at 447K msg/s
-  - Standalone mode for RTE
 
 ## Tables
 
-| Table | Fields | Location | Subscribers |
-|-------|--------|----------|-------------|
-| `trade_binance` | 14 fields | TP, RDB | RDB, RTE |
-| `quote_binance` | 11 fields | TP | (none currently) |
+| Table | Fields | Location |
+|-------|--------|----------|
+| `trade_binance` | 14 fields | TP, RDB |
+| `quote_binance` | 12 fields | TP, RDB |
+| `health_feed_handler` | 10 fields | TP, RDB |
 
-## Open Issues / Next Steps
+## Feed Handler Features
 
-1. [ ] KX Dashboards visualization
-2. [ ] RDB subscription to quotes (optional)
-3. [ ] Quote telemetry aggregation
-4. [ ] Production hardening (reconnect logic)
-5. [ ] L5 publication (future)
+- **Reconnection**: Exponential backoff (1s → 8s max) for Binance and TP
+- **Signal handling**: Graceful shutdown on SIGINT/SIGTERM
+- **Configuration**: JSON files for symbols, ports, logging
+- **Logging**: spdlog with levels (info/debug), console + optional file
+- **Health**: Uptime, message counts, connection state every 5 seconds
+- **Validation**: Trade ID gaps, order book sequence numbers
 
-## Key Technical Details
-
-### Quote Handler State Machine
+## Configuration Example
+```json
+{
+    "symbols": ["btcusdt", "ethusdt", "solusdt"],
+    "tickerplant": {"host": "localhost", "port": 5010},
+    "reconnect": {"initial_backoff_ms": 1000, "max_backoff_ms": 8000},
+    "logging": {"level": "info", "file": ""}
+}
 ```
-INIT → SYNCING → VALID ↔ INVALID
-       (snapshot)  (deltas)  (gap)
-```
-
-### Log Files
-- Trade log: `logs/YYYY.MM.DD.trade.log`
-- Quote log: `logs/YYYY.MM.DD.quote.log`
-- Binary IPC format, 145-byte messages (trades)
-
-### Publication Discipline (Quotes)
-- Publish on L1 change (price or qty)
-- Publish on validity change
-- Publish on 50ms timeout
-- Never publish stale data as valid
-
-## Performance Baselines
-
-| Metric | Value |
-|--------|-------|
-| Replay throughput | 447K msg/s |
-| Live trade rate | ~50-100 trades/sec |
-| Live quote rate | ~20-50 quotes/sec (after filtering) |
-| Log message size | 145 bytes (trades) |
 
 ## Useful Commands
 ```bash
 # Build
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build && cmake --build build
 
-# Start full pipeline
+# Start pipeline
 ./start.sh
 
-# Stop all
-./stop.sh
-
 # Manual start
-q kdb/tp.q                      # Terminal 1
-q kdb/rdb.q                     # Terminal 2
-q kdb/rte.q                     # Terminal 3
-./build/binance_feed_handler    # Terminal 4
-./build/binance_quote_handler   # Terminal 5
+q kdb/tp.q                       # Terminal 1
+q kdb/rdb.q                      # Terminal 2  
+q kdb/rte.q                      # Terminal 3
+./build/trade_feed_handler       # Terminal 4
+./build/quote_feed_handler       # Terminal 5
 
-# Verify data
-select count i by sym from trade_binance  # In TP or RDB
-select count i by sym from quote_binance  # In TP only
-rollAnalytics                              # In RTE
+# Custom config
+./build/trade_feed_handler /path/to/config.json
+
+# Verify
+select count i by sym from trade_binance
+select count i by sym from quote_binance
+select last uptimeSec, last connState by handler from health_feed_handler
+rollAnalytics
 ```
 
 ## Key Decisions Summary
 
 | Decision | Choice | ADR |
 |----------|--------|-----|
-| C++ Standard | C++17 | - |
 | Trade ingestion | Tick-by-tick, async IPC | ADR-002 |
 | Quote ingestion | Snapshot + delta reconciliation | ADR-009 |
-| Process architecture | Separate Trade FH and Quote FH | ADR-009 |
 | Durability | TP logging (separate files) | ADR-003 |
-| Recovery | Replay from TP log | ADR-006 |
-| Analytics | Tick-by-tick, 5-min rolling window | ADR-004 |
+| Analytics | 5-min rolling window | ADR-004 |
 | Telemetry | 1-sec buckets, 15-min retention | ADR-005 |
+| Error handling | Fail-fast with logging | ADR-008 |
 
-## Files to Upload at Session Start
+## Open Items
 
-1. This file (`CONTEXT.md`)
-2. Any files being actively worked on
-3. Relevant ADRs if discussing architecture
-4. `CMakeLists.txt` if build issues
+1. [ ] KX Dashboards visualization
+2. [ ] Quote telemetry aggregation
+3. [ ] L5 order book (future)

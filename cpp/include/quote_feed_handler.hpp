@@ -1,21 +1,24 @@
 /**
  * @file quote_feed_handler.hpp
- * @brief WebSocket depth stream handler with snapshot reconciliation
+ * @brief WebSocket depth stream handler with snapshot reconciliation (L5)
  * 
- * Implements the full L1 book lifecycle:
- *   1. Connect to @depth WebSocket stream
+ * Implements the full L5 book lifecycle:
+ *   1. Connect to @depth@100ms WebSocket stream
  *   2. Buffer incoming deltas
  *   3. Fetch REST snapshot
  *   4. Apply snapshot + buffered deltas
  *   5. Continue applying live deltas
- *   6. Publish L1 on change/timeout
+ *   6. Publish L5 on change/timeout
  * 
- * State machine:
+ * State machine (per symbol):
  *   INIT → (start buffering) → SYNCING → (snapshot + deltas) → VALID
  *   VALID → (sequence gap) → INVALID → INIT (rebuild)
  * 
- * @see docs/decisions/adr-002-Feed-handler-to-kdb-ingestion-path.md
- * @see docs/decisions/adr-008-Error-Handling-Strategy.md
+ * Uses OrderBookManager for:
+ *   - Flat-array storage (cache-friendly for 100+ symbols)
+ *   - O(1) symbol lookup
+ *   - Integrated publisher state
+ * 
  * @see docs/decisions/adr-009-L1-Order-Book-Architecture.md
  */
 
@@ -31,11 +34,10 @@
 
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <deque>
 #include <atomic>
+#include <memory>
 
-#include "order_book.hpp"
+#include "order_book_manager.hpp"
 #include "rest_client.hpp"
 
 extern "C" {
@@ -49,39 +51,15 @@ namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
 /**
- * @brief Buffered delta for replay after snapshot
- */
-struct BufferedDelta {
-    long long firstUpdateId;
-    long long finalUpdateId;
-    long long eventTimeMs;
-    std::vector<PriceLevel> bids;
-    std::vector<PriceLevel> asks;
-};
-
-/**
- * @brief Per-symbol state for quote handling
- */
-struct SymbolState {
-    OrderBook book;
-    L1Publisher publisher;
-    std::deque<BufferedDelta> deltaBuffer;
-    bool snapshotRequested = false;
-    
-    explicit SymbolState(const std::string& sym) 
-        : book(sym), publisher(sym) {}
-};
-
-/**
  * @class QuoteFeedHandler
- * @brief Handles real-time L1 quote data from Binance depth streams
+ * @brief Handles real-time L5 quote data from Binance depth streams
  * 
  * Key responsibilities:
  *   - WebSocket connection management (TLS) with auto-reconnect
- *   - Order book state management (INIT → SYNCING → VALID)
+ *   - Order book state management via OrderBookManager
  *   - REST snapshot fetching for initial sync
  *   - Delta buffering and replay
- *   - L1 quote extraction and publication
+ *   - L5 quote extraction and publication
  *   - Graceful shutdown on signal
  */
 class QuoteFeedHandler {
@@ -107,6 +85,9 @@ public:
     
     /// Backoff multiplier
     static constexpr int BACKOFF_MULTIPLIER = 2;
+    
+    /// Snapshot depth to request (get more than L5 for safety)
+    static constexpr int SNAPSHOT_DEPTH = 50;
 
     // ========================================================================
     // CONSTRUCTION
@@ -163,7 +144,8 @@ private:
     // CONFIGURATION
     // ========================================================================
     
-    std::vector<std::string> symbols_;
+    std::vector<std::string> symbolsLower_;    // Lowercase for WebSocket subscription
+    std::vector<std::string> symbolsUpper_;    // Uppercase for internal use
     std::string tpHost_;
     int tpPort_;
     
@@ -174,8 +156,8 @@ private:
     /// Shutdown flag
     std::atomic<bool> running_{true};
     
-    /// Per-symbol state (order books, publishers, buffers)
-    std::unordered_map<std::string, SymbolState> states_;
+    /// Order book manager (flat arrays, all symbols)
+    std::unique_ptr<OrderBookManager> bookMgr_;
     
     /// Tickerplant connection handle
     int tpHandle_{-1};
@@ -227,26 +209,23 @@ private:
     /// Sleep with exponential backoff
     bool sleepWithBackoff(int attempt);
     
-    /// Reset all order books (on reconnect)
-    void resetAllBooks();
-    
     /// Process incoming WebSocket message
     void processMessage(const std::string& msg, long long fhRecvTimeUtcNs);
     
     /// Handle delta based on current book state
-    void handleDelta(SymbolState& state, const BufferedDelta& delta, long long fhRecvTimeUtcNs);
+    void handleDelta(int symIdx, const BufferedDelta& delta, long long fhRecvTimeUtcNs);
     
-    /// Request and apply snapshot
-    void requestSnapshot(SymbolState& state);
+    /// Request and apply snapshot for a symbol
+    void requestSnapshot(int symIdx);
     
-    /// Check if should publish and do it
-    void maybePublish(SymbolState& state, long long fhRecvTimeUtcNs);
+    /// Maybe publish L5 for a symbol
+    void maybePublish(int symIdx, long long fhRecvTimeUtcNs);
     
-    /// Publish invalid state
-    void publishInvalid(SymbolState& state, long long fhRecvTimeUtcNs);
+    /// Publish invalid state for a symbol
+    void publishInvalid(int symIdx, long long fhRecvTimeUtcNs);
     
-    /// Publish L1 quote to kdb+
-    void publishL1(const L1Quote& quote);
+    /// Publish L5 quote to kdb+
+    void publishL5(const L5Quote& quote);
     
     /// Check publish timeouts for all symbols
     void checkPublishTimeouts(long long fhRecvTimeUtcNs);

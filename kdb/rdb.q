@@ -1,5 +1,5 @@
-
 / rdb.q - Real-Time Database
+/ Updated for L5 quotes (28 fields)
 
 / -----------------------------------------------------------------------------
 / Configuration
@@ -9,10 +9,10 @@
 .rdb.epochOffset:946684800000000000j;
 
 / -----------------------------------------------------------------------------
-/ Table Schema (14 fields - includes rdbApplyTimeUtcNs)
+/ Table Schema
 / -----------------------------------------------------------------------------
 
-
+/ Trade table - 14 fields (includes rdbApplyTimeUtcNs)
 trade_binance:([]
   time:`timestamp$();
   sym:`symbol$();
@@ -30,13 +30,35 @@ trade_binance:([]
   rdbApplyTimeUtcNs:`long$()
   );
 
+/ Quote table - L5 depth (28 fields: includes rdbApplyTimeUtcNs)
 quote_binance:([]
   time:`timestamp$();
   sym:`symbol$();
-  bidPrice:`float$();
-  bidQty:`float$();
-  askPrice:`float$();
-  askQty:`float$();
+  / L5 bid prices (best to worst)
+  bidPrice1:`float$();
+  bidPrice2:`float$();
+  bidPrice3:`float$();
+  bidPrice4:`float$();
+  bidPrice5:`float$();
+  / L5 bid quantities
+  bidQty1:`float$();
+  bidQty2:`float$();
+  bidQty3:`float$();
+  bidQty4:`float$();
+  bidQty5:`float$();
+  / L5 ask prices (best to worst)
+  askPrice1:`float$();
+  askPrice2:`float$();
+  askPrice3:`float$();
+  askPrice4:`float$();
+  askPrice5:`float$();
+  / L5 ask quantities
+  askQty1:`float$();
+  askQty2:`float$();
+  askQty3:`float$();
+  askQty4:`float$();
+  askQty5:`float$();
+  / Metadata
   isValid:`boolean$();
   exchEventTimeMs:`long$();
   fhRecvTimeUtcNs:`long$();
@@ -125,7 +147,13 @@ health_feed_handler:([]
 / Connect and subscribe to TP
 .rdb.connect[];
 
--1 "RDB ready - storage only (telemetry via TEL process)";
+-1 "Tables:";
+-1 "  trade_binance: ",string[count cols trade_binance]," fields";
+-1 "  quote_binance: ",string[count cols quote_binance]," fields (L5)";
+-1 "  health_feed_handler: ",string[count cols health_feed_handler]," fields";
+
+-1 "";
+-1 "RDB ready";
 
 / -----------------------------------------------------------------------------
 / End

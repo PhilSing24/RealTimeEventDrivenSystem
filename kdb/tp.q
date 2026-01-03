@@ -1,5 +1,6 @@
 / tp.q
 / Tickerplant with pub-sub, timestamp capture, and logging
+/ Updated for L5 quotes (27 fields)
 
 / -------------------------------------------------------
 / Configuration
@@ -13,9 +14,10 @@
 .tp.epochOffset:946684800000000000j;
 
 / -------------------------------------------------------
-/ Table schema (13 fields - TP does not know rdbApplyTimeUtcNs)
+/ Table schema
 / -------------------------------------------------------
 
+/ Trade table - 13 fields (TP adds tpRecvTimeUtcNs, RDB adds rdbApplyTimeUtcNs)
 trade_binance:([]
   time:`timestamp$();
   sym:`symbol$();
@@ -32,13 +34,36 @@ trade_binance:([]
   tpRecvTimeUtcNs:`long$()
   );
 
+/ Quote table - L5 depth (27 fields: 22 price/qty + 5 meta + tpRecvTimeUtcNs)
+/ FH sends 26 fields, TP adds tpRecvTimeUtcNs
 quote_binance:([]
   time:`timestamp$();
   sym:`symbol$();
-  bidPrice:`float$();
-  bidQty:`float$();
-  askPrice:`float$();
-  askQty:`float$();
+  / L5 bid prices (best to worst)
+  bidPrice1:`float$();
+  bidPrice2:`float$();
+  bidPrice3:`float$();
+  bidPrice4:`float$();
+  bidPrice5:`float$();
+  / L5 bid quantities
+  bidQty1:`float$();
+  bidQty2:`float$();
+  bidQty3:`float$();
+  bidQty4:`float$();
+  bidQty5:`float$();
+  / L5 ask prices (best to worst)
+  askPrice1:`float$();
+  askPrice2:`float$();
+  askPrice3:`float$();
+  askPrice4:`float$();
+  askPrice5:`float$();
+  / L5 ask quantities
+  askQty1:`float$();
+  askQty2:`float$();
+  askQty3:`float$();
+  askQty4:`float$();
+  askQty5:`float$();
+  / Metadata
   isValid:`boolean$();
   exchEventTimeMs:`long$();
   fhRecvTimeUtcNs:`long$();
@@ -61,41 +86,52 @@ health_feed_handler:([]
   );
 
 / -------------------------------------------------------
-/ Logging
+/ Logging - Separate files for trades and quotes
 / -------------------------------------------------------
 
+/ Log handles (set at startup)
+.tp.tradeLogHandle:0N;
+.tp.quoteLogHandle:0N;
+
 / Build log file path for today
-.tp.logFile:{
-  hsym `$(.tp.cfg.logDir,"/",string[.z.D],".log")
+/ @param typ - `trade or `quote
+.tp.logFile:{[typ]
+  hsym `$(.tp.cfg.logDir,"/",string[.z.D],".",string[typ],".log")
   };
 
-/ Open log file
+/ Open log files
 .tp.openLog:{[]
   if[not .tp.cfg.logEnabled; :()];
-  .tp.logHandle:hopen .tp.logFile[];
-  -1 "Log file opened: ",string .tp.logFile[];
+  system "mkdir -p ",.tp.cfg.logDir;
+  .tp.tradeLogHandle:hopen .tp.logFile[`trade];
+  .tp.quoteLogHandle:hopen .tp.logFile[`quote];
+  -1 "Trade log opened: ",string .tp.logFile[`trade];
+  -1 "Quote log opened: ",string .tp.logFile[`quote];
   };
 
-/ Close log file
+/ Close log files
 .tp.closeLog:{[]
   if[not .tp.cfg.logEnabled; :()];
-  if[not null .tp.logHandle; hclose .tp.logHandle];
+  if[not null .tp.tradeLogHandle; hclose .tp.tradeLogHandle];
+  if[not null .tp.quoteLogHandle; hclose .tp.quoteLogHandle];
   };
 
-/ Write to log
+/ Write to appropriate log
 .tp.log:{[tbl;data]
   if[not .tp.cfg.logEnabled; :()];
-  .tp.logHandle enlist (`.u.upd; tbl; data);
+  $[tbl = `trade_binance;
+    .tp.tradeLogHandle enlist (`.u.upd; tbl; data);
+    tbl = `quote_binance;
+    .tp.quoteLogHandle enlist (`.u.upd; tbl; data);
+    ()  / health_feed_handler - not logged
+  ];
   };
 
-/ Rotate log (call at end of day)
+/ Rotate logs (call at end of day)
 .tp.rotate:{[]
   .tp.closeLog[];
   .tp.openLog[];
   };
-
-/ Log handle (set at startup)
-.tp.logHandle:0N;
 
 / -------------------------------------------------------
 / Pub/Sub Infrastructure (.u namespace - kdb+ convention)
@@ -110,7 +146,10 @@ health_feed_handler:([]
 .u.sub:{[tbl;syms]
   if[not tbl in key .u.w; '"unknown table: ",string tbl];
   .u.w[tbl],::.z.w;
-  (tbl; value tbl; .tp.logFile[]; count value tbl)
+  logFile:$[tbl = `trade_binance; .tp.logFile[`trade];
+            tbl = `quote_binance; .tp.logFile[`quote];
+            `];
+  (tbl; value tbl; logFile; count value tbl)
   };
 
 / Publish to all subscribers of a table
@@ -170,10 +209,13 @@ system "p ",string .tp.cfg.port;
 -1 "TP starting on port ",string[.tp.cfg.port];
 -1 "Logging: ",$[.tp.cfg.logEnabled; "enabled"; "disabled"];
 
-/ Open log file
+/ Open log files
 .tp.openLog[];
 
--1 "Subscribers: ", .Q.s1 .u.w;
+-1 "Tables:";
+-1 "  trade_binance: ",string[count cols trade_binance]," fields";
+-1 "  quote_binance: ",string[count cols quote_binance]," fields (L5)";
+-1 "  health_feed_handler: ",string[count cols health_feed_handler]," fields";
 
 / -------------------------------------------------------
 / End

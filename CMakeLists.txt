@@ -48,20 +48,3 @@ target_include_directories(quote_feed_handler PRIVATE
 )
 
 target_link_libraries(quote_feed_handler ${COMMON_LIBS})
-
-# Snapshot test utility
-add_executable(test_snapshot
-    cpp/src/test_snapshot.cpp
-)
-
-target_include_directories(test_snapshot PRIVATE
-    ${INCLUDE_DIR}
-    ${KDB_DIR}
-)
-
-target_link_libraries(test_snapshot
-    Boost::system
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    Threads::Threads
-)

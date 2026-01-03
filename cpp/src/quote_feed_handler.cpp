@@ -1,6 +1,9 @@
 /**
  * @file quote_feed_handler.cpp
- * @brief Implementation of QuoteFeedHandler class
+ * @brief Implementation of QuoteFeedHandler class (L5 version)
+ * 
+ * Uses OrderBookManager for efficient multi-symbol book management.
+ * Publishes L5 quotes (22 price/qty fields) to kdb+.
  */
 
 #include "quote_feed_handler.hpp"
@@ -12,6 +15,8 @@
 #include <chrono>
 #include <thread>
 #include <csignal>
+#include <algorithm>
+#include <cctype>
 
 // ============================================================================
 // CONSTRUCTION / DESTRUCTION
@@ -20,18 +25,21 @@
 QuoteFeedHandler::QuoteFeedHandler(const std::vector<std::string>& symbols,
                                    const std::string& tpHost,
                                    int tpPort)
-    : symbols_(symbols)
-    , tpHost_(tpHost)
+    : tpHost_(tpHost)
     , tpPort_(tpPort)
     , startTime_(std::chrono::system_clock::now())
 {
-    // Initialize per-symbol state
+    // Store lowercase (for WebSocket) and uppercase (for internal use)
     for (const auto& sym : symbols) {
-        // Convert to uppercase for internal use
+        symbolsLower_.push_back(sym);
+        
         std::string upper = sym;
-        for (auto& c : upper) c = std::toupper(c);
-        states_.emplace(upper, SymbolState(upper));
+        std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+        symbolsUpper_.push_back(upper);
     }
+    
+    // Create book manager with uppercase symbols
+    bookMgr_ = std::make_unique<OrderBookManager>(symbolsUpper_);
 }
 
 QuoteFeedHandler::~QuoteFeedHandler() {
@@ -46,8 +54,8 @@ QuoteFeedHandler::~QuoteFeedHandler() {
 // ============================================================================
 
 void QuoteFeedHandler::run() {
-    spdlog::info("Starting...");
-    spdlog::info("Symbols: {}", fmt::join(symbols_, " "));
+    spdlog::info("Starting L5 Quote Feed Handler...");
+    spdlog::info("Symbols: {}", fmt::join(symbolsLower_, " "));
     
     // Connect to tickerplant
     if (!connectToTP()) {
@@ -93,10 +101,11 @@ void QuoteFeedHandler::stop() {
 // ============================================================================
 
 std::string QuoteFeedHandler::buildDepthStreamPath() const {
+    // Use @depth@100ms for 10 updates/second (faster than @depth which is 1/sec)
     std::string path = "/stream?streams=";
-    for (size_t i = 0; i < symbols_.size(); ++i) {
+    for (size_t i = 0; i < symbolsLower_.size(); ++i) {
         if (i > 0) path += "/";
-        path += symbols_[i] + "@depth";
+        path += symbolsLower_[i] + "@depth@100ms";
     }
     return path;
 }
@@ -141,14 +150,6 @@ bool QuoteFeedHandler::sleepWithBackoff(int attempt) {
     return running_;
 }
 
-void QuoteFeedHandler::resetAllBooks() {
-    for (auto& [sym, state] : states_) {
-        state.book.reset();
-        state.deltaBuffer.clear();
-        state.snapshotRequested = false;
-    }
-}
-
 // ============================================================================
 // WEBSOCKET LOOP
 // ============================================================================
@@ -160,7 +161,7 @@ void QuoteFeedHandler::runWebSocketLoop() {
     connState_ = "connecting";
     
     // Reset all books on reconnect
-    resetAllBooks();
+    bookMgr_->resetAll();
     
     // Initialize ASIO and SSL
     net::io_context ioc;
@@ -180,7 +181,7 @@ void QuoteFeedHandler::runWebSocketLoop() {
     // WebSocket handshake
     ws.handshake(BINANCE_HOST, target);
     
-    spdlog::info("Connected to Binance ({} symbols)", symbols_.size());
+    spdlog::info("Connected to Binance ({} symbols)", symbolsLower_.size());
     connState_ = "connected";
     
     // Reset backoff
@@ -240,21 +241,20 @@ void QuoteFeedHandler::processMessage(const std::string& msg, long long fhRecvTi
     doc.Parse(msg.c_str());
     if (!doc.IsObject()) return;
     
-    // Combined stream format: {"stream":"btcusdt@depth","data":{...}}
+    // Combined stream format: {"stream":"btcusdt@depth@100ms","data":{...}}
     if (!doc.HasMember("data")) return;
     const auto& d = doc["data"];
     if (!d.IsObject()) return;
     
-    // Extract symbol
+    // Extract symbol (uppercase)
     if (!d.HasMember("s")) return;
     std::string sym = d["s"].GetString();
     
-    auto it = states_.find(sym);
-    if (it == states_.end()) return;
-    
-    SymbolState& state = it->second;
+    int symIdx = bookMgr_->getSymbolIndex(sym);
+    if (symIdx < 0) return;  // Unknown symbol
     
     // Parse delta fields
+    // U = first update ID, u = final update ID, E = event time
     if (!d.HasMember("U") || !d.HasMember("u")) return;
     
     BufferedDelta delta;
@@ -264,79 +264,75 @@ void QuoteFeedHandler::processMessage(const std::string& msg, long long fhRecvTi
     
     // Parse bid updates
     if (d.HasMember("b") && d["b"].IsArray()) {
-        const auto& bids = d["b"];
-        for (rapidjson::SizeType i = 0; i < bids.Size(); ++i) {
-            if (bids[i].IsArray() && bids[i].Size() >= 2) {
-                PriceLevel lvl;
-                lvl.price = std::stod(bids[i][0].GetString());
-                lvl.qty = std::stod(bids[i][1].GetString());
-                delta.bids.push_back(lvl);
+        for (const auto& lvl : d["b"].GetArray()) {
+            if (lvl.IsArray() && lvl.Size() >= 2) {
+                PriceLevel pl;
+                pl.price = std::stod(lvl[0].GetString());
+                pl.qty = std::stod(lvl[1].GetString());
+                delta.bids.push_back(pl);
             }
         }
     }
     
     // Parse ask updates
     if (d.HasMember("a") && d["a"].IsArray()) {
-        const auto& asks = d["a"];
-        for (rapidjson::SizeType i = 0; i < asks.Size(); ++i) {
-            if (asks[i].IsArray() && asks[i].Size() >= 2) {
-                PriceLevel lvl;
-                lvl.price = std::stod(asks[i][0].GetString());
-                lvl.qty = std::stod(asks[i][1].GetString());
-                delta.asks.push_back(lvl);
+        for (const auto& lvl : d["a"].GetArray()) {
+            if (lvl.IsArray() && lvl.Size() >= 2) {
+                PriceLevel pl;
+                pl.price = std::stod(lvl[0].GetString());
+                pl.qty = std::stod(lvl[1].GetString());
+                delta.asks.push_back(pl);
             }
         }
     }
     
-    // Handle based on book state
-    handleDelta(state, delta, fhRecvTimeUtcNs);
+    // Handle delta based on book state
+    handleDelta(symIdx, delta, fhRecvTimeUtcNs);
 }
 
-void QuoteFeedHandler::handleDelta(SymbolState& state, const BufferedDelta& delta, long long fhRecvTimeUtcNs) {
-    OrderBook& book = state.book;
+void QuoteFeedHandler::handleDelta(int symIdx, const BufferedDelta& delta, long long fhRecvTimeUtcNs) {
+    BookState state = bookMgr_->getState(symIdx);
     
-    switch (book.state()) {
-        case OrderBook::State::INIT:
-            // Start buffering, request snapshot
-            state.deltaBuffer.push_back(delta);
-            if (!state.snapshotRequested) {
-                state.snapshotRequested = true;
-                requestSnapshot(state);
+    switch (state) {
+        case BookState::INIT:
+            // Buffer delta and request snapshot
+            bookMgr_->getDeltaBuffer(symIdx).push_back(delta);
+            
+            if (bookMgr_->needsSnapshot(symIdx)) {
+                requestSnapshot(symIdx);
             }
             break;
             
-        case OrderBook::State::SYNCING:
-            // Try to apply delta to transition to VALID
-            if (!book.applyDelta(delta.firstUpdateId, delta.finalUpdateId,
-                                 delta.bids, delta.asks, delta.eventTimeMs)) {
-                publishInvalid(state, fhRecvTimeUtcNs);
-                book.reset();
-                state.snapshotRequested = false;
+        case BookState::SYNCING:
+            // Apply delta (may transition to VALID)
+            if (!bookMgr_->applyDelta(symIdx, delta.firstUpdateId, delta.finalUpdateId,
+                                      delta.bids, delta.asks, delta.eventTimeMs)) {
+                spdlog::warn("{} failed to apply delta in SYNCING state", 
+                    bookMgr_->getSymbol(symIdx));
+                publishInvalid(symIdx, fhRecvTimeUtcNs);
+                bookMgr_->reset(symIdx);
             } else {
-                if (book.isValid()) {
-                    maybePublish(state, fhRecvTimeUtcNs);
+                if (bookMgr_->isValid(symIdx)) {
+                    maybePublish(symIdx, fhRecvTimeUtcNs);
                 }
             }
             break;
             
-        case OrderBook::State::VALID:
+        case BookState::VALID:
             // Apply delta directly
-            if (!book.applyDelta(delta.firstUpdateId, delta.finalUpdateId,
-                                 delta.bids, delta.asks, delta.eventTimeMs)) {
-                publishInvalid(state, fhRecvTimeUtcNs);
-                book.reset();
-                state.deltaBuffer.clear();
-                state.snapshotRequested = false;
+            if (!bookMgr_->applyDelta(symIdx, delta.firstUpdateId, delta.finalUpdateId,
+                                      delta.bids, delta.asks, delta.eventTimeMs)) {
+                spdlog::warn("{} sequence gap detected", bookMgr_->getSymbol(symIdx));
+                publishInvalid(symIdx, fhRecvTimeUtcNs);
+                bookMgr_->reset(symIdx);
             } else {
-                maybePublish(state, fhRecvTimeUtcNs);
+                maybePublish(symIdx, fhRecvTimeUtcNs);
             }
             break;
             
-        case OrderBook::State::INVALID:
+        case BookState::INVALID:
             // Reset and start over
-            book.reset();
-            state.deltaBuffer.clear();
-            state.snapshotRequested = false;
+            bookMgr_->reset(symIdx);
             break;
     }
 }
@@ -345,36 +341,45 @@ void QuoteFeedHandler::handleDelta(SymbolState& state, const BufferedDelta& delt
 // SNAPSHOT HANDLING
 // ============================================================================
 
-void QuoteFeedHandler::requestSnapshot(SymbolState& state) {
-    spdlog::info("Requesting snapshot for {}", state.book.symbol());
+void QuoteFeedHandler::requestSnapshot(int symIdx) {
+    const std::string& sym = bookMgr_->getSymbol(symIdx);
+    spdlog::info("Requesting snapshot for {}", sym);
+    
+    bookMgr_->setSnapshotRequested(symIdx, true);
     
     // Fetch snapshot (blocking)
-    SnapshotData snapshot = restClient_.fetchSnapshot(state.book.symbol(), BOOK_DEPTH * 10);
+    SnapshotData snapshot = restClient_.fetchSnapshot(sym, SNAPSHOT_DEPTH);
     
     if (!snapshot.success) {
-        spdlog::error("Snapshot failed: {}", snapshot.error);
-        state.book.invalidate("Snapshot fetch failed");
+        spdlog::error("Snapshot failed for {}: {}", sym, snapshot.error);
+        bookMgr_->invalidate(symIdx, "Snapshot fetch failed");
         return;
     }
     
     // Apply snapshot
-    state.book.applySnapshot(snapshot.lastUpdateId, snapshot.bids, snapshot.asks, 0);
+    bookMgr_->applySnapshot(symIdx, snapshot.lastUpdateId, snapshot.bids, snapshot.asks);
     
-    spdlog::debug("Applying {} buffered deltas", state.deltaBuffer.size());
+    spdlog::debug("{} snapshot applied, lastUpdateId={}", sym, snapshot.lastUpdateId);
     
     // Apply buffered deltas
-    for (const auto& delta : state.deltaBuffer) {
-        if (!state.book.applyDelta(delta.firstUpdateId, delta.finalUpdateId,
-                                   delta.bids, delta.asks, delta.eventTimeMs)) {
+    auto& buffer = bookMgr_->getDeltaBuffer(symIdx);
+    spdlog::debug("Applying {} buffered deltas for {}", buffer.size(), sym);
+    
+    while (!buffer.empty()) {
+        const auto& delta = buffer.front();
+        if (!bookMgr_->applyDelta(symIdx, delta.firstUpdateId, delta.finalUpdateId,
+                                  delta.bids, delta.asks, delta.eventTimeMs)) {
+            spdlog::warn("{} failed during buffered delta replay", sym);
             break;
         }
+        buffer.pop_front();
     }
     
-    // Clear buffer
-    state.deltaBuffer.clear();
+    // Clear remaining buffer
+    buffer.clear();
     
-    if (state.book.isValid()) {
-        spdlog::info("Book {} is now VALID", state.book.symbol());
+    if (bookMgr_->isValid(symIdx)) {
+        spdlog::info("{} is now VALID", sym);
     }
 }
 
@@ -382,41 +387,66 @@ void QuoteFeedHandler::requestSnapshot(SymbolState& state) {
 // PUBLISHING
 // ============================================================================
 
-void QuoteFeedHandler::maybePublish(SymbolState& state, long long fhRecvTimeUtcNs) {
+void QuoteFeedHandler::maybePublish(int symIdx, long long fhRecvTimeUtcNs) {
     ++fhSeqNo_;
-    L1Quote quote = state.book.getL1(fhRecvTimeUtcNs, fhSeqNo_);
+    L5Quote quote = bookMgr_->getL5(symIdx, fhRecvTimeUtcNs, fhSeqNo_);
     
-    if (state.publisher.shouldPublish(quote)) {
-        publishL1(quote);
-        state.publisher.recordPublish(quote);
+    if (bookMgr_->shouldPublish(symIdx, quote)) {
+        publishL5(quote);
+        bookMgr_->recordPublish(symIdx, quote);
     }
 }
 
-void QuoteFeedHandler::publishInvalid(SymbolState& state, long long fhRecvTimeUtcNs) {
+void QuoteFeedHandler::publishInvalid(int symIdx, long long fhRecvTimeUtcNs) {
     ++fhSeqNo_;
-    L1Quote quote;
-    quote.sym = state.book.symbol();
-    quote.bid = {0.0, 0.0};
-    quote.ask = {0.0, 0.0};
+    L5Quote quote;
+    quote.sym = bookMgr_->getSymbol(symIdx);
     quote.isValid = false;
     quote.fhRecvTimeUtcNs = fhRecvTimeUtcNs;
     quote.fhSeqNo = fhSeqNo_;
+    // All price/qty fields default to 0.0
     
-    publishL1(quote);
-    state.publisher.recordPublish(quote);
+    publishL5(quote);
+    bookMgr_->recordPublish(symIdx, quote);
     
     spdlog::warn("Published INVALID for {}", quote.sym);
 }
 
-void QuoteFeedHandler::publishL1(const L1Quote& quote) {
-    // Build kdb+ row matching quote_binance schema
-    K row = knk(10,
+void QuoteFeedHandler::publishL5(const L5Quote& quote) {
+    // Build kdb+ row matching quote_binance L5 schema
+    // FH sends 26 fields, TP adds tpRecvTimeUtcNs (27th)
+    // Schema: time, sym, bidPrice1..5, bidQty1..5, askPrice1..5, askQty1..5, 
+    //         isValid, exchEventTimeMs, fhRecvTimeUtcNs, fhSeqNo
+    
+    K row = knk(26,
+        // time, sym
         ktj(-KP, quote.fhRecvTimeUtcNs - KDB_EPOCH_OFFSET_NS),
         ks((S)quote.sym.c_str()),
-        kf(quote.bid.price),
-        kf(quote.bid.qty),
-        kf(quote.ask.price),
-        kf(quote.ask.qty),
+        // Bid prices (5)
+        kf(quote.bidPrice1),
+        kf(quote.bidPrice2),
+        kf(quote.bidPrice3),
+        kf(quote.bidPrice4),
+        kf(quote.bidPrice5),
+        // Bid quantities (5)
+        kf(quote.bidQty1),
+        kf(quote.bidQty2),
+        kf(quote.bidQty3),
+        kf(quote.bidQty4),
+        kf(quote.bidQty5),
+        // Ask prices (5)
+        kf(quote.askPrice1),
+        kf(quote.askPrice2),
+        kf(quote.askPrice3),
+        kf(quote.askPrice4),
+        kf(quote.askPrice5),
+        // Ask quantities (5)
+        kf(quote.askQty1),
+        kf(quote.askQty2),
+        kf(quote.askQty3),
+        kf(quote.askQty4),
+        kf(quote.askQty5),
+        // Metadata
         kb(quote.isValid),
         kj(quote.exchEventTimeMs),
         kj(quote.fhRecvTimeUtcNs),
@@ -437,7 +467,23 @@ void QuoteFeedHandler::publishL1(const L1Quote& quote) {
         tpHandle_ = -1;
         if (connectToTP()) {
             // Resend to new connection
-            k(-tpHandle_, (S)".u.upd", ks((S)"quote_binance"), row, (K)0);
+            K row2 = knk(26,
+                ktj(-KP, quote.fhRecvTimeUtcNs - KDB_EPOCH_OFFSET_NS),
+                ks((S)quote.sym.c_str()),
+                kf(quote.bidPrice1), kf(quote.bidPrice2), kf(quote.bidPrice3),
+                kf(quote.bidPrice4), kf(quote.bidPrice5),
+                kf(quote.bidQty1), kf(quote.bidQty2), kf(quote.bidQty3),
+                kf(quote.bidQty4), kf(quote.bidQty5),
+                kf(quote.askPrice1), kf(quote.askPrice2), kf(quote.askPrice3),
+                kf(quote.askPrice4), kf(quote.askPrice5),
+                kf(quote.askQty1), kf(quote.askQty2), kf(quote.askQty3),
+                kf(quote.askQty4), kf(quote.askQty5),
+                kb(quote.isValid),
+                kj(quote.exchEventTimeMs),
+                kj(quote.fhRecvTimeUtcNs),
+                kj(quote.fhSeqNo)
+            );
+            k(-tpHandle_, (S)".u.upd", ks((S)"quote_binance"), row2, (K)0);
         }
     }
 }
@@ -468,7 +514,7 @@ void QuoteFeedHandler::publishHealth() {
         ktj(-KP, toKdbTs(lastMsgTime_)),           // lastMsgTimeUtc
         ktj(-KP, toKdbTs(lastPubTime_)),           // lastPubTimeUtc
         ks((S)connState_.c_str()),                  // connState
-        ki(static_cast<int>(symbols_.size()))       // symbolCount
+        ki(static_cast<int>(symbolsLower_.size()))  // symbolCount
     );
     
     // Publish to TP (fire and forget)
@@ -479,30 +525,25 @@ void QuoteFeedHandler::publishHealth() {
 }
 
 void QuoteFeedHandler::checkPublishTimeouts(long long fhRecvTimeUtcNs) {
-    for (auto& [sym, state] : states_) {
-        if (state.book.isValid()) {
-            ++fhSeqNo_;
-            L1Quote quote = state.book.getL1(fhRecvTimeUtcNs, fhSeqNo_);
-            if (state.publisher.shouldPublish(quote)) {
-                publishL1(quote);
-                state.publisher.recordPublish(quote);
-            }
-        }
+    // Get symbols that need timeout publish
+    std::vector<int> needsPublish = bookMgr_->getTimeoutPublishNeeded();
+    
+    for (int symIdx : needsPublish) {
+        ++fhSeqNo_;
+        L5Quote quote = bookMgr_->getL5(symIdx, fhRecvTimeUtcNs, fhSeqNo_);
+        publishL5(quote);
+        bookMgr_->recordPublish(symIdx, quote);
     }
 }
 
 // ============================================================================
-// CONFIGURATION
+// CONFIGURATION AND MAIN
 // ============================================================================
 
 #include "config.hpp"
 #include "logger.hpp"
 
 static const std::string DEFAULT_CONFIG_PATH = "config/quote_feed_handler.json";
-
-// ============================================================================
-// SIGNAL HANDLING
-// ============================================================================
 
 // Global pointer for signal handler access
 static QuoteFeedHandler* g_handler = nullptr;
@@ -517,12 +558,8 @@ static void signalHandler(int signum) {
     }
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
-
 int main(int argc, char* argv[]) {
-    std::cout << "=== Binance Quote Feed Handler ===\n";
+    std::cout << "=== Binance L5 Quote Feed Handler ===" << std::endl;
     
     // Determine config path (from argument or default)
     std::string configPath = DEFAULT_CONFIG_PATH;
